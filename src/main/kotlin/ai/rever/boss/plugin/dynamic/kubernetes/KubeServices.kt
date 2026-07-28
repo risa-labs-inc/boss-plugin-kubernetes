@@ -23,13 +23,44 @@ class KubeServices(val context: PluginContext) {
     val engine = KubeEngine(scope) { context.projectPath }
     val forwards = PortForwardManager(scope, engine)
     val actions = KubeActions(this)
+    val helm = HelmEngine(scope, engine)
+    val helmActions = HelmActions(this)
+
+    /**
+     * The one terminal tab this plugin owns for running commands, as
+     * (windowId, terminalId, tabId).
+     *
+     * All kubectl/helm commands reuse this single tab instead of creating one per
+     * command. It is deliberately *our* tab rather than whatever happens to be
+     * focused: `sendCommand` types into the terminal's active tab, so without an
+     * owned tab a command could be typed into the user's own shell session.
+     *
+     * Session-scoped and never persisted — tab ids don't survive a restart.
+     */
+    @Volatile
+    var commandTerminal: CommandTerminal? = null
 
     private val storage: PluginStorageProvider? by lazy {
         runCatching { context.pluginStorageFactory?.createStorage(PLUGIN_ID) }.getOrNull()
     }
 
+    /**
+     * Nudge the Helm release list after a command that a terminal tab owns.
+     *
+     * Helm has no watch API, so there is nothing to push us an update; a short delay
+     * lets the command land before we look, and the periodic reconcile catches
+     * anything slower.
+     */
+    fun scheduleHelmRefresh() {
+        scope.launch {
+            delay(HELM_SETTLE_MS)
+            helm.refreshReleases()
+        }
+    }
+
     fun start() {
         engine.start()
+        helm.start()
         scope.launch {
             // Restore the selection and pinned CRDs before the first render, so the
             // panel doesn't flash the wrong namespace.
@@ -47,8 +78,43 @@ class KubeServices(val context: PluginContext) {
 
     fun dispose() {
         forwards.dispose()
+        helm.dispose()
         engine.dispose()
         scope.cancel()
+    }
+
+    /** Open (or focus) the Helm release tab for [release]. */
+    suspend fun openReleaseTabVerified(release: String): TabOpenOutcome {
+        val target = engine.target.value
+        val tabInfo = HelmReleaseTabInfo(
+            contextName = target.context.orEmpty(),
+            namespace = target.namespace,
+            releaseName = release,
+        )
+        val tabs = context.activeTabsProvider
+        tabs?.activeTabs?.value?.firstOrNull { it.tabId == tabInfo.id }?.let { existing ->
+            tabs.selectTab(existing.tabId, existing.panelId)
+            return TabOpenOutcome.Focused
+        }
+        val ops = context.splitViewOperations ?: return TabOpenOutcome.NoSplitViewOperations
+        ops.openTab(tabInfo)
+
+        if (tabs == null) return TabOpenOutcome.Unverifiable
+        repeat(TAB_POLL_ATTEMPTS) {
+            delay(TAB_POLL_INTERVAL_MS)
+            if (tabs.activeTabs.value.any { it.tabId == tabInfo.id }) return TabOpenOutcome.Opened
+        }
+        return TabOpenOutcome.Dropped
+    }
+
+    fun openReleaseTab(release: String) {
+        scope.launch {
+            when (openReleaseTabVerified(release)) {
+                TabOpenOutcome.Dropped -> toastError("The host dropped the tab — reload the Kubernetes plugin")
+                TabOpenOutcome.NoSplitViewOperations -> toastError("This host cannot open tabs")
+                else -> Unit
+            }
+        }
     }
 
     fun rememberTarget() {
@@ -143,8 +209,16 @@ class KubeServices(val context: PluginContext) {
 
         private const val TAB_POLL_ATTEMPTS = 25
         private const val TAB_POLL_INTERVAL_MS = 100L
+        private const val HELM_SETTLE_MS = 2_500L
     }
 }
+
+/** Identifies the terminal tab the plugin runs its commands in. */
+data class CommandTerminal(
+    val windowId: String,
+    val terminalId: String,
+    val tabId: String,
+)
 
 /** What [KubeServices.openResourceTabVerified] observed. */
 enum class TabOpenOutcome {

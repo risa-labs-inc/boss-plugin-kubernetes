@@ -34,9 +34,16 @@ enum class KubeSection(val label: String, val resource: String) {
     SECRETS("Secrets", "secrets"),
     PVCS("Volume claims", "persistentvolumeclaims"),
     CUSTOM("Custom resources", ""),
+
+    /**
+     * Helm sections. They carry no kubectl resource because Helm has no watch API —
+     * releases refresh on the reconcile tick and after each Helm command instead.
+     */
+    RELEASES("Helm releases", ""),
+    REPOS("Chart repos", ""),
     ;
 
-    /** PROJECT and CUSTOM are handled specially, not by a plain `get <resource>`. */
+    /** Sections with a blank resource are handled specially, not by `get <resource>`. */
     val isPlainResource: Boolean get() = resource.isNotBlank()
 }
 
@@ -351,7 +358,9 @@ class KubeEngine(
                 .sortedBy { it.name }
 
             KubeSection.CUSTOM -> refreshCustom()
-            KubeSection.PROJECT -> Unit
+            // Helm sections are owned by HelmEngine — it has its own refresh path,
+            // driven by the reconcile tick and by Helm commands completing.
+            KubeSection.RELEASES, KubeSection.REPOS, KubeSection.PROJECT -> Unit
         }
     }
 
@@ -528,6 +537,9 @@ class KubeEngine(
     }
 
     // ------------------------------------------------------- project scanning
+
+    /** The open project's root, or null when there is no usable project path. */
+    fun projectRoot(): File? = getProjectPath()?.let(::File)?.takeIf { it.isDirectory }
 
     fun rescanProject() {
         scanner?.cancel()

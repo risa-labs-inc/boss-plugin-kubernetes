@@ -39,7 +39,13 @@ class KubernetesDynamicPlugin : DynamicPlugin {
         context.tabRegistry.registerTabType(KubeResourceTabType) { tabInfo, ctx ->
             KubeResourceTabComponent(ctx, tabInfo, services)
         }
+        context.tabRegistry.registerTabType(HelmReleaseTabType) { tabInfo, ctx ->
+            HelmReleaseTabComponent(ctx, tabInfo, services)
+        }
         context.registerMcpToolProvider(KubeMcpToolProvider(pluginId, services))
+        // A second provider so the helm_* tools stand or fall on their own — helm
+        // being absent must not affect the kubectl-backed tools.
+        context.registerMcpToolProvider(HelmMcpToolProvider("$pluginId.helm", services))
     }
 
     override fun dispose() {

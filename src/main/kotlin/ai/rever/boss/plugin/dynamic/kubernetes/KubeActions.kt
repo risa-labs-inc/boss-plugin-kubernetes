@@ -1,6 +1,7 @@
 package ai.rever.boss.plugin.dynamic.kubernetes
 
 import ai.rever.boss.plugin.api.TabSplitMode
+import ai.rever.boss.plugin.api.TerminalTabPluginAPI
 import ai.rever.boss.plugin.tab.terminal.TerminalTabInfo
 import java.io.File
 
@@ -84,13 +85,29 @@ class KubeActions(private val services: KubeServices) {
         )
     }
 
+    /**
+     * Run [command] in a terminal.
+     *
+     * **Prefers adding a tab inside a terminal you already have open** rather than
+     * opening another BOSS tab. Every apply/diff/exec/helm command spawning a
+     * top-level tab clutters the tab bar fast, and BossTerm already has its own tab
+     * strip built for exactly this.
+     *
+     * Falls back to a new BOSS terminal tab when there is no live terminal to join
+     * (or [forceNewTab] is set, or the terminal-tab plugin isn't loaded).
+     */
     fun openTerminal(
         id: String,
         title: String,
         command: String,
         workingDir: String?,
         location: OpenLocation = OpenLocation.NEW_TAB,
+        forceNewTab: Boolean = false,
     ): Boolean {
+        if (!forceNewTab && location == OpenLocation.NEW_TAB && runInExistingTerminal(command, workingDir)) {
+            return true
+        }
+
         val ops = services.context.splitViewOperations ?: run {
             services.toastError("No terminal available — run manually: $command")
             return false
@@ -107,6 +124,78 @@ class KubeActions(private val services: KubeServices) {
             OpenLocation.SPLIT_DOWN -> ops.openTabInSplit(tabInfo, TabSplitMode.HORIZONTAL_SPLIT)
         }
         return true
+    }
+
+    /**
+     * Run [command] in the single terminal tab this plugin owns, creating that tab
+     * only the first time.
+     *
+     * Two things this must not do: create a tab per command (the tab strip fills up
+     * within minutes of normal use), and type into a tab the plugin doesn't own —
+     * `sendCommand` goes to the terminal's *active* tab, so blindly sending would
+     * inject a `helm upgrade` into whatever the user happens to be running.
+     *
+     * @return true if the command was delivered to a terminal.
+     */
+    private fun runInExistingTerminal(command: String, workingDir: String?): Boolean {
+        // Resolved per call: cross-plugin APIs can appear after our register().
+        val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java) ?: return false
+        val tabs = services.context.activeTabsProvider?.activeTabs?.value ?: return false
+
+        // Reuse our own tab when it's still there.
+        services.commandTerminal?.let { owned ->
+            val stillHosted = tabs.any { it.tabId == owned.terminalId && it.windowId == owned.windowId }
+            val stillOpen = stillHosted && runCatching {
+                api.listTabs(owned.windowId, owned.terminalId).any { it.id == owned.tabId }
+            }.getOrDefault(false)
+            if (stillOpen) {
+                // Switch first: sendCommand targets the active tab, so this is what
+                // guarantees the command lands in ours.
+                val switched = runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }
+                    .getOrDefault(false)
+                if (switched) {
+                    val full = if (workingDir.isNullOrBlank()) command else "cd ${q(workingDir)} && $command"
+                    val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }
+                        .getOrDefault(false)
+                    if (sent) {
+                        focusHostTab(tabs, owned.terminalId)
+                        return true
+                    }
+                }
+            }
+            // Gone or unusable — forget it and make a fresh one below.
+            services.commandTerminal = null
+        }
+
+        // Probe every tab rather than filtering on a typeId string: hasTerminalState
+        // is a registry lookup and the authoritative answer to "is this a tabbed
+        // terminal?", so it can't drift if the type id is renamed. Prefer this
+        // window's terminals over another window's.
+        val myWindow = services.context.windowId
+        val candidate = tabs.asSequence()
+            .sortedByDescending { it.windowId == myWindow }
+            .firstOrNull { runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false) }
+            ?: return false
+
+        val newTabId = runCatching {
+            api.createTab(
+                windowId = candidate.windowId,
+                terminalId = candidate.tabId,
+                workingDirectory = workingDir,
+                initialCommand = command,
+            )
+        }.getOrNull() ?: return false
+
+        services.commandTerminal = CommandTerminal(candidate.windowId, candidate.tabId, newTabId)
+        runCatching { api.switchToTab(candidate.windowId, candidate.tabId, newTabId) }
+        focusHostTab(tabs, candidate.tabId)
+        return true
+    }
+
+    /** Bring the BOSS tab hosting the terminal forward so the output is visible. */
+    private fun focusHostTab(tabs: List<ai.rever.boss.plugin.api.ActiveTabData>, terminalId: String) {
+        val host = tabs.firstOrNull { it.tabId == terminalId } ?: return
+        runCatching { services.context.activeTabsProvider?.selectTab(host.tabId, host.panelId) }
     }
 
     // ---------------------------------------------------------- in-plugin ops

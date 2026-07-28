@@ -21,7 +21,11 @@
   "definedPermissions": [
     {
       "name": "kubernetes.manage",
-      "description": "Delete, scale and restart Kubernetes resources"
+      "description": "Delete, scale and restart Kubernetes resources, and install, upgrade, roll back or uninstall Helm releases"
+    },
+    {
+      "name": "helm.publish",
+      "description": "Push packaged Helm charts to an OCI registry"
     }
   ],
   "sandbox": {
