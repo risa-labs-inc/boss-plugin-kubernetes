@@ -102,11 +102,24 @@ cascade helpers** — no delete-all, no prune, no delete-namespace.
 ### Helm specifics
 
 **Every command reuses one plugin-owned terminal tab.** `KubeActions.openTerminal` first tries
-`runInExistingTerminal`, which reuses the tab recorded in `KubeServices.commandTerminal`
-(`switchToTab` then `sendCommand`), creating it only once. Two things it must not do: open a tab
-per command (the strip fills within minutes), or send into whatever tab is focused —
-`sendCommand` writes to the terminal's *active* tab, so without an owned tab a `helm upgrade`
-would be typed into the user's own shell session. Opening a fresh BOSS tab is the last resort.
+`runInExistingTerminal`, which reuses the tab recorded in `KubeServices.commandTerminal`,
+creating it only once. Two things it must not do: open a tab per command (the strip fills within
+minutes), or send into whatever tab is focused — `sendCommand` writes to the terminal's *active*
+tab, so without an owned tab a `helm upgrade` would be typed into the user's own shell session.
+Opening a fresh BOSS tab is the last resort.
+
+The sequence is `switchToTab` → **`sendInterrupt`** → 500 ms → `sendCommand`, matching what
+terminal-tab does for a re-run. The interrupt is not cosmetic: `sendCommand` writes to the pty,
+so with a foreground process still running (a `helm install --wait`, an `exec -it`) the text goes
+to *that process's stdin* and never runs, while the caller still gets `true` and reports success
+for a command that vanished. The API exposes no idle/running signal, so interrupting is the only
+way to guarantee the shell is the reader. Safe here because the tab only ever holds this plugin's
+own commands. The whole read-act-write is `synchronized` — `@Volatile` on `commandTerminal` gives
+visibility, not atomicity, and the callers sit on different dispatchers.
+
+The working directory is never implicit: it defaults to `projectPath`, because on reuse the tab
+sits wherever the last command left it and a relative `-f ./manifest.yaml` would resolve against
+the wrong project.
 
 **Helm 4 removed and renamed CLI surface**, all verified against 4.2.3 rather than assumed:
 
