@@ -94,10 +94,7 @@ private fun KubePanelScreen(viewModel: KubePanelViewModel) {
         Divider(color = BossThemeColors.BorderColor)
 
         when (cluster) {
-            is ClusterState.KubectlMissing -> EmptyBody(
-                "kubectl isn't installed",
-                "Install kubectl (or Docker Desktop's bundled copy) and reopen this panel.",
-            )
+            is ClusterState.KubectlMissing -> MissingToolBody(viewModel, InstallableTool.KUBECTL)
 
             is ClusterState.NoContext -> EmptyBody(
                 "No kubeconfig context",
@@ -277,6 +274,56 @@ private fun Selector(
 private fun LoadingBody() {
     Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         CircularProgressIndicator(modifier = Modifier.size(20.dp), strokeWidth = 2.dp)
+    }
+}
+
+/**
+ * Not-installed state with an offer to install.
+ *
+ * The install runs in the plugin's terminal tab after an explicit confirmation —
+ * nothing happens to the machine from opening this panel. Without Homebrew the
+ * button links to the tool's own instructions rather than guessing a package
+ * manager.
+ */
+@Composable
+private fun MissingToolBody(viewModel: KubePanelViewModel, tool: InstallableTool) {
+    val canInstall = viewModel.canInstallTools
+    Column(
+        modifier = Modifier.fillMaxSize().padding(20.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Icon(
+            imageVector = if (tool == InstallableTool.HELM) HelmIcon else KubeIcon,
+            contentDescription = null,
+            tint = BossThemeColors.TextMuted.copy(alpha = 0.5f),
+            modifier = Modifier.size(34.dp),
+        )
+        Spacer(Modifier.height(10.dp))
+        Text(
+            "${tool.label} isn't installed",
+            color = BossThemeColors.TextSecondary,
+            fontSize = 13.sp,
+            fontWeight = FontWeight.Medium,
+        )
+        Spacer(Modifier.height(4.dp))
+        Text(
+            text = if (canInstall) {
+                "Install it in the terminal, or install it yourself and this panel will pick it up."
+            } else {
+                "Homebrew isn't available here, so follow the official instructions."
+            },
+            color = BossThemeColors.TextMuted,
+            fontSize = 11.sp,
+        )
+        Spacer(Modifier.height(12.dp))
+        TextButton(onClick = { viewModel.installTool(tool) }) {
+            Text(
+                text = if (canInstall) "Install ${tool.label}…" else "Open install docs",
+                color = BossThemeColors.AccentColor,
+                fontSize = 12.sp,
+            )
+        }
     }
 }
 
@@ -587,7 +634,7 @@ private fun KubeLists(viewModel: KubePanelViewModel) {
 
         section(KubeSection.RELEASES, releases.size, expanded, viewModel) {
             if (helmState is HelmState.Missing) {
-                item { HintRow("helm isn't installed — install it to manage releases") }
+                item { InstallHelmRow(viewModel) }
             } else if (releases.isEmpty()) {
                 item { HintRow("No Helm releases in this namespace") }
             }
@@ -628,7 +675,7 @@ private fun KubeLists(viewModel: KubePanelViewModel) {
                 }
             }
             if (helmState is HelmState.Missing) {
-                item { HintRow("helm isn't installed") }
+                item { InstallHelmRow(viewModel) }
             } else if (repos.isEmpty()) {
                 item { HintRow("No chart repositories configured") }
             }
@@ -727,6 +774,24 @@ private fun StatusDot(healthy: Boolean, warning: Boolean) {
         else -> BossThemeColors.ErrorColor
     }
     Box(Modifier.size(6.dp).background(color, RoundedCornerShape(3.dp)))
+}
+
+/** Inline "helm isn't installed" row with the install offer, for the Helm sections. */
+@Composable
+private fun InstallHelmRow(viewModel: KubePanelViewModel) {
+    Row(
+        modifier = Modifier.fillMaxWidth().padding(start = 24.dp, end = 8.dp, top = 2.dp, bottom = 6.dp),
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text("helm isn't installed", color = BossThemeColors.TextMuted, fontSize = 11.sp)
+        TextButton(onClick = { viewModel.installTool(InstallableTool.HELM) }) {
+            Text(
+                text = if (viewModel.canInstallTools) "Install…" else "Docs",
+                color = BossThemeColors.AccentColor,
+                fontSize = 11.sp,
+            )
+        }
+    }
 }
 
 @Composable

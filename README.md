@@ -91,6 +91,12 @@ namespace it came from:
   Docker Desktop's bundled copy) and a reachable cluster
 - `helm` for the Helm features — optional; without it those sections say so and everything
   else works. Helm 3 and 4 are both supported (the flag dialect is picked from the version).
+
+If `kubectl` or `helm` is missing, the panel offers to install it: it shows you the exact command
+and, once you confirm, runs it in the terminal tab where you can watch or stop it. Nothing is
+installed silently, and where Homebrew isn't available the button opens the tool's own
+instructions instead of guessing a package manager. Once the binary appears, the panel picks it
+up on its own — no reload.
 - BOSS ≥ 9.2.35, boss-plugin-api ≥ 1.0.48
 
 Cloud kubeconfigs that shell out to credential plugins (`gke-gcloud-auth-plugin`, `aws`) work
