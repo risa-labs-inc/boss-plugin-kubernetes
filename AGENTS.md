@@ -147,6 +147,24 @@ handler then answers "No Helm releases" — which reads as "nothing installed" w
 "I can't see". Local-only tools (charts, lint, template, repos, package) stay usable when the
 cluster is down.
 
+### Installing missing tools
+
+`ToolInstaller` + `KubePanelViewModel.installTool` offer to install `kubectl`/`helm`, and the
+rules matter more than the code:
+
+- **Nothing installs itself.** The offer is a button, the confirmation names the exact command,
+  and the command runs in the plugin's terminal tab where it is visible and killable. Installing
+  developer tooling touches PATH and sometimes wants sudo; a sidebar must not do that quietly.
+- **Only when Homebrew is actually present.** Elsewhere the button opens the tool's own docs
+  rather than guessing a package manager, and the plugin will never suggest piping a remote
+  script into a shell.
+- `brew install kubectl` resolves to the `kubernetes-cli` formula; Docker Desktop's cask is
+  `docker-desktop` (not `docker`).
+- After launching an install, `watchForTool` polls for the binary (~2 min) and re-probes so the
+  panel leaves its not-installed state on its own. This works because neither `KubectlCli` nor
+  `HelmCli` keeps a *negative* resolution: a null result isn't sticky, so the next probe finds a
+  freshly installed binary without a reload. Verified by moving `helm` aside and back.
+
 ### Known host gap (not fixable from here)
 
 `DynamicPluginManager.disablePlugin` calls `trackingContext.unregisterAll()` but **never calls

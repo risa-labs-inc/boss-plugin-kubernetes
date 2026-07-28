@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.kubernetes
 
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
@@ -142,6 +143,69 @@ class KubePanelViewModel(private val services: KubeServices) {
             engine.refreshNamespaces()
             services.helm.refreshReleases()
             services.helm.refreshRepos()
+        }
+    }
+
+    // ------------------------------------------------------- installing tools
+
+    /** True when a terminal install can be offered; otherwise we link to docs. */
+    val canInstallTools: Boolean get() = ToolInstaller.canInstallWithBrew()
+
+    /**
+     * Offer to install [tool] in the plugin's terminal tab.
+     *
+     * Nothing is installed without an explicit confirmation naming the exact
+     * command, and where there is no safe suggestion the docs open instead of a
+     * guessed package manager.
+     */
+    fun installTool(tool: InstallableTool) {
+        val command = ToolInstaller.installCommand(tool)
+        if (command == null) {
+            services.openUrl(tool.docsUrl, "Install ${tool.label}")
+            return
+        }
+        askConfirm(
+            title = "Install ${tool.label}?",
+            message = "Runs `$command` in the terminal tab, where you can watch it and stop it. " +
+                "Nothing else on your system is touched.",
+            confirmLabel = "Install",
+        ) {
+            val launched = services.actions.openTerminal(
+                id = "install-${tool.binary}-${System.currentTimeMillis()}",
+                title = "Install ${tool.label}",
+                command = command,
+                workingDir = services.context.projectPath,
+            )
+            if (launched) {
+                services.toastInfo("Installing ${tool.label}…")
+                watchForTool(tool)
+            }
+        }
+    }
+
+    /**
+     * Poll for the binary appearing after an install, then re-probe so the panel
+     * switches out of its not-installed state on its own.
+     */
+    private fun watchForTool(tool: InstallableTool) {
+        scope.launch {
+            repeat(INSTALL_POLL_ATTEMPTS) {
+                delay(INSTALL_POLL_INTERVAL_MS)
+                if (!tool.isPresent()) return@repeat
+                when (tool) {
+                    InstallableTool.KUBECTL -> {
+                        engine.probeCluster()
+                        engine.refreshContexts()
+                    }
+                    InstallableTool.HELM -> {
+                        services.helm.probe()
+                        services.helm.refreshRepos()
+                        services.helm.refreshReleases()
+                    }
+                }
+                services.toastSuccess("${tool.label} is available now")
+                return@launch
+            }
         }
     }
 
@@ -524,5 +588,11 @@ class KubePanelViewModel(private val services: KubeServices) {
                 services.toastError(result.cleanError.take(200))
             }
         }
+    }
+
+    private companion object {
+        /** ~2 minutes total: a brew install of kubectl or helm is well under that. */
+        const val INSTALL_POLL_ATTEMPTS = 40
+        const val INSTALL_POLL_INTERVAL_MS = 3_000L
     }
 }
