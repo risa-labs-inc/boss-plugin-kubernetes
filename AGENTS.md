@@ -117,6 +117,18 @@ way to guarantee the shell is the reader. Safe here because the tab only ever ho
 own commands — and announced with a toast, since it does mean an unrelated command in flight gets
 stopped.
 
+**`kubectl exec -it` never shares the tab.** Ctrl-C is not a universal "stop that": under
+`exec -it` kubectl holds the local terminal in raw mode and *forwards* 0x03 to the remote
+process, so the container's shell takes the SIGINT and prints a prompt while kubectl keeps
+owning the pty. The interrupt that makes reuse safe for everything else does nothing here, and
+the next command would be typed **into the container's shell** — in a pod with kubectl and a
+mounted service-account token that runs against the cluster with the *pod's* credentials, and
+the sidebar would report success. Hence `TerminalCommandKind`: `Interactive` gets its own
+sub-tab and is never recorded as owned, `Mutation` (helm install/upgrade/rollback/uninstall)
+shares the tab but its warning says that stopping one can leave the release `pending-upgrade`,
+`Batch` is everything else. Add a new terminal command with the kind that matches what holds
+the pty, not the one that looks tidiest.
+
 **Commands are delivered through a single-consumer `Channel`, not a lock.** `runInExistingTerminal`
 only decides *whether* a terminal exists and enqueues; one coroutine drains the queue and performs
 every switch/interrupt/wait/send. This is load-bearing twice over. A `synchronized` block that
@@ -131,6 +143,12 @@ on the shared services object, where any call site could retarget the tab withou
 The working directory is never implicit: it defaults to `projectPath`, because on reuse the tab
 sits wherever the last command left it and a relative `-f ./manifest.yaml` would resolve against
 the wrong project.
+
+**Anything timed after a terminal command must hang off `onDelivered`, not `openTerminal`'s
+return.** That return now means "queued", not "typed" — delivery costs the interrupt sequence
+plus every command ahead of it in the queue. `HelmActions.runHelmTerminal` learned this the hard
+way: `scheduleHelmRefresh()`'s 2.5 s settle was being counted from acceptance, so the release
+list could refresh before helm had started and leave the sidebar on the pre-upgrade state.
 
 **Helm 4 removed and renamed CLI surface**, all verified against 4.2.3 rather than assumed:
 
