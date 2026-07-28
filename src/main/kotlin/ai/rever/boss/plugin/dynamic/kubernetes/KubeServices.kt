@@ -26,19 +26,6 @@ class KubeServices(val context: PluginContext) {
     val helm = HelmEngine(scope, engine)
     val helmActions = HelmActions(this)
 
-    /**
-     * The one terminal tab this plugin owns for running commands, as
-     * (windowId, terminalId, tabId).
-     *
-     * All kubectl/helm commands reuse this single tab instead of creating one per
-     * command. It is deliberately *our* tab rather than whatever happens to be
-     * focused: `sendCommand` types into the terminal's active tab, so without an
-     * owned tab a command could be typed into the user's own shell session.
-     *
-     * Session-scoped and never persisted — tab ids don't survive a restart.
-     */
-    @Volatile
-    var commandTerminal: CommandTerminal? = null
 
     private val storage: PluginStorageProvider? by lazy {
         runCatching { context.pluginStorageFactory?.createStorage(PLUGIN_ID) }.getOrNull()

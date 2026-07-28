@@ -114,8 +114,19 @@ so with a foreground process still running (a `helm install --wait`, an `exec -i
 to *that process's stdin* and never runs, while the caller still gets `true` and reports success
 for a command that vanished. The API exposes no idle/running signal, so interrupting is the only
 way to guarantee the shell is the reader. Safe here because the tab only ever holds this plugin's
-own commands. The whole read-act-write is `synchronized` — `@Volatile` on `commandTerminal` gives
-visibility, not atomicity, and the callers sit on different dispatchers.
+own commands — and announced with a toast, since it does mean an unrelated command in flight gets
+stopped.
+
+**Commands are delivered through a single-consumer `Channel`, not a lock.** `runInExistingTerminal`
+only decides *whether* a terminal exists and enqueues; one coroutine drains the queue and performs
+every switch/interrupt/wait/send. This is load-bearing twice over. A `synchronized` block that
+holds across the interrupt but `launch`es the send does not work — a second command's interrupt
+then lands before the first has been typed, so the first runs and the second is swallowed, which
+is the original bug one step later. And the sequence must not run on the UI thread: panel clicks
+call `openTerminal` directly, and the body makes cross-plugin calls whose threading contract this
+plugin does not control, so a blocking monitor there risks parking the UI thread. One consumer
+also means `ownedTerminal` needs no `@Volatile` and lives privately in `KubeActions` rather than
+on the shared services object, where any call site could retarget the tab without queueing.
 
 The working directory is never implicit: it defaults to `projectPath`, because on reuse the tab
 sits wherever the last command left it and a relative `-f ./manifest.yaml` would resolve against
