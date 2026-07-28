@@ -206,11 +206,6 @@ class KubeServices(val context: PluginContext) {
 }
 
 /** Identifies the terminal tab the plugin runs its commands in. */
-data class CommandTerminal(
-    val windowId: String,
-    val terminalId: String,
-    val tabId: String,
-)
 
 /** What [KubeServices.openResourceTabVerified] observed. */
 enum class TabOpenOutcome {
