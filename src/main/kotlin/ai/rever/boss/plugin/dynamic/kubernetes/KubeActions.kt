@@ -20,18 +20,15 @@ enum class OpenLocation { NEW_TAB, SPLIT_RIGHT, SPLIT_DOWN }
  * treating them alike is unsafe rather than merely untidy.
  */
 enum class TerminalCommandKind {
-    /** Runs, prints, exits. Interrupting one costs at most its output. */
-    Batch,
-
     /**
-     * Changes cluster state and can leave it wedged if stopped partway.
+     * Shares the plugin's tab, and may be interrupted by the next command.
      *
-     * Ctrl-C on `helm install/upgrade --wait` stops the *client*, but the release stays
-     * in `pending-install`/`pending-upgrade` and the next upgrade then fails with
-     * "another operation (install/upgrade/rollback) is in progress". Shares the tab, but
-     * the warning has to say that, not "no harm done".
+     * That is survivable for a read, and costly for a `helm upgrade --wait` — Ctrl-C
+     * stops the client but leaves the release in `pending-upgrade`, so the next upgrade
+     * fails with "another operation in progress". The `helm_*` tools say so up front
+     * rather than the plugin discovering it afterwards.
      */
-    Mutation,
+    Batch,
 
     /**
      * Holds the pty and cannot be interrupted out of. **Never shares the tab.**
@@ -103,13 +100,6 @@ class KubeActions(private val services: KubeServices) {
     @Volatile
     private var ownedTerminal: CommandTerminal? = null
 
-    /** When the consumer last typed into the owned tab; 0 if it never has. */
-    private var lastSendAtMs = 0L
-    private var lastDeliveredKind = TerminalCommandKind.Batch
-
-    private fun markSent() {
-        lastSendAtMs = System.currentTimeMillis()
-    }
 
     /**
      * One command per send, drained in order by [runTerminalCommands].
@@ -344,6 +334,10 @@ class KubeActions(private val services: KubeServices) {
             try {
                 deliver(queued)
             } catch (cancel: CancellationException) {
+                // Named for the same reason dispose() names what it drops: this command
+                // was already reported as launched, and it is the one most likely to
+                // matter, because it was mid-delivery rather than still queued.
+                System.err.println("[Kubernetes] Cancelled mid-delivery: ${queued.command}")
                 throw cancel // plugin is being disposed; not a delivery failure
             } catch (t: Throwable) {
                 System.err.println("[Kubernetes] Terminal delivery failed: $t")
@@ -377,13 +371,26 @@ class KubeActions(private val services: KubeServices) {
                 if (owned != null) {
                     deliverToOwnedTab(api, owned, full, queued.kind)
                 } else {
-                    createOwnedTab(api, tabs, queued.command, queued.workingDir, queued.kind)
+                    // `full`, not the bare command: both paths then derive the directory
+                    // the same way. Relying on createTab's workingDirectory here instead
+                    // would mean that if it is ever not honoured for the initial command,
+                    // the *first* command runs in the wrong place and every later one is
+                    // right — miserable to debug, and for `kubectl apply -f ./x.yaml` it
+                    // is the wrong file, not just the wrong directory.
+                    createOwnedTab(api, tabs, full, queued.kind)
                 }
             }
         }
         if (delivered) {
             runCatching { queued.onDelivered?.invoke() }
         } else {
+            // Forget the tab. `liveOwnedTerminal` only drops it when it is *gone*, so a
+            // tab that exists but refuses writes would otherwise stay owned forever:
+            // every later command would pay two Ctrl-Cs and 1.2 s, stop whatever is in
+            // it, and open a BOSS tab anyway — the clutter this exists to prevent, on a
+            // loop, in silence.
+            System.err.println("[Kubernetes] Terminal refused the command; dropping the owned tab")
+            ownedTerminal = null
             fallBackToBossTab(queued)
         }
     }
@@ -439,10 +446,12 @@ class KubeActions(private val services: KubeServices) {
     /**
      * Type [full] into the tab we own, interrupting whatever is running there first.
      *
-     * Reusing one tab makes these commands mutually exclusive, and that is a real cost
-     * rather than a free win, so it is announced. What the announcement has to say
-     * depends on what was there before — stopping a `helm upgrade --wait` does not just
-     * lose output, it leaves the release pending — hence [lastDeliveredKind].
+     * Reusing one tab makes these commands mutually exclusive, which is a real cost:
+     * stopping a `helm upgrade --wait` does not just lose output, it leaves the release
+     * in `pending-upgrade`. That is said prospectively by the `helm_*` tools, at the
+     * moment a caller can still act on it, rather than by a toast after the fact — there
+     * is no liveness signal to gate one on, so it fired on every command and became
+     * noise (boss-plugins#11).
      *
      * **The wait before typing is a heuristic, and the known weak point here.**
      * `sendCommand` writes to the pty, so the shell has to be the one reading by the
@@ -480,40 +489,15 @@ class KubeActions(private val services: KubeServices) {
         if (!runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }.getOrDefault(false)) {
             return false
         }
-        val interrupted = lastDeliveredKind
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(INTERRUPT_ESCALATE_MS)
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(SHELL_REGAIN_LINE_MS)
         val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }.getOrDefault(false)
         if (sent) {
-            // Reported only once the send succeeded. Announcing the interrupt first meant
-            // a failed send stopped whatever was running, said so, and *then* opened a
-            // BOSS tab anyway — the worst of both, and two notifications for one command.
-            //
             // Deliberately not phrased as "interrupting the previous command": nothing
             // tells us whether one was still running, and a toast that cries wolf every
             // time is the one that gets tuned out on the occasion it matters.
-            // Only when something plausibly *was* running. A `hasSentCommand` flag was
-            // useless as a guard: deliverToOwnedTab is reachable only once an owned tab
-            // exists, and creating one sets it — so it was always true and the toast
-            // fired on every command, which is the cry-wolf case this is meant to avoid.
-            // Elapsed time is still a heuristic (nothing reports liveness —
-            // boss-plugins#11), but it goes quiet for the common shape: run something,
-            // read the output, run the next thing.
-            val since = System.currentTimeMillis() - lastSendAtMs
-            if (lastSendAtMs != 0L && since < INTERRUPT_WARN_WINDOW_MS) {
-                services.toastInfo(
-                    if (interrupted == TerminalCommandKind.Mutation) {
-                        "Reusing the plugin terminal — a helm operation may still be running there, " +
-                            "and stopping one can leave the release pending"
-                    } else {
-                        "Reusing the plugin terminal — anything still running there is stopped"
-                    },
-                )
-            }
-            markSent()
-            lastDeliveredKind = kind
             // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
             // focusing a tab that has since moved is benign but wrong, and this is free.
             focusHostTab(owned.terminalId, owned.windowId)
@@ -553,7 +537,6 @@ class KubeActions(private val services: KubeServices) {
         api: TerminalTabPluginAPI,
         tabs: List<ActiveTabData>,
         command: String,
-        dir: String?,
         kind: TerminalCommandKind,
     ): Boolean {
         val host = findTerminalHost(api, tabs) ?: return false
@@ -561,17 +544,13 @@ class KubeActions(private val services: KubeServices) {
             api.createTab(
                 windowId = host.windowId,
                 terminalId = host.tabId,
-                workingDirectory = dir,
+                // No workingDirectory: `command` carries its own cd, so this path and the
+                // reuse path agree on where a command runs.
                 initialCommand = command,
             )
         }.getOrNull() ?: return false
 
         ownedTerminal = CommandTerminal(host.windowId, host.tabId, newTabId)
-        // Stamped, not skipped: createTab is given `initialCommand`, so the tab does not
-        // start idle — it starts running this command, and the next delivery needs that
-        // when deciding whether a warning is warranted.
-        markSent()
-        lastDeliveredKind = kind
         runCatching { api.switchToTab(host.windowId, host.tabId, newTabId) }
         focusHostTab(host.tabId, host.windowId)
         return true
@@ -655,12 +634,6 @@ class KubeActions(private val services: KubeServices) {
         /** Gap before the second Ctrl-C, which is what forces a stubborn client to quit. */
         private const val INTERRUPT_ESCALATE_MS = 400L
 
-        /**
-         * How recently we must have typed for "something may still be running" to be
-         * worth saying. Long enough to cover an ordinary helm rollout, short enough that
-         * picking the plugin up again after a break is silent.
-         */
-        private const val INTERRUPT_WARN_WINDOW_MS = 3 * 60 * 1000L
 
         fun isSecretKind(kind: String): Boolean =
             kind.lowercase().trimEnd('s') == "secret"

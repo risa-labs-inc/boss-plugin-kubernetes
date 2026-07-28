@@ -124,10 +124,24 @@ owning the pty. The interrupt that makes reuse safe for everything else does not
 the next command would be typed **into the container's shell** — in a pod with kubectl and a
 mounted service-account token that runs against the cluster with the *pod's* credentials, and
 the sidebar would report success. Hence `TerminalCommandKind`: `Interactive` gets its own
-sub-tab and is never recorded as owned, `Mutation` (helm install/upgrade/rollback/uninstall)
-shares the tab but its warning says that stopping one can leave the release `pending-upgrade`,
-`Batch` is everything else. Add a new terminal command with the kind that matches what holds
-the pty, not the one that looks tidiest.
+sub-tab and is never recorded as owned; `Batch` shares. Classify a new terminal command by what
+holds the pty, not by what looks tidiest — if Ctrl-C will not free it, it is `Interactive`.
+
+**`openTerminal` returning true means "accepted for delivery", not "running".** The command is
+queued; the consumer types it later, after the interrupt sequence and after anything ahead of it.
+So anything timed from that return is wrong (see `onDelivered` below), and a command can still
+fall back to a BOSS tab — or fail — after its caller was told it launched. The `helm_*` and `k8s_*`
+tools hedge their wording for this and name what interrupting costs, which is where the warning
+belongs: prospectively, while the caller can still act on it. There is deliberately **no** toast
+after the fact — with no liveness signal there is nothing to gate one on, so it fired on every
+command and became noise (boss-plugins#11).
+
+**No API-version floor was raised for the terminal reuse.** Everything it uses predates the
+declared `minApiVersion` 1.0.48: `getPluginAPI`, `PluginContext.windowId`, `ActiveTabData.windowId`,
+`hasTerminalState` and `sendInterrupt` land in `boss-plugin-api` **1.0.16**, and
+`TerminalTabPluginAPI` / `createTab` / `switchToTab` / `listTabs` in **1.0.23**. The
+`runCatching { Throwable }` wrap is not the compatibility contract — it is there for the case that
+terminal-tab simply is not loaded, which logs rather than degrading in silence.
 
 **Commands are delivered through a single-consumer `Channel`, not a lock.** `runInExistingTerminal`
 only decides *whether* a terminal exists and enqueues; one coroutine drains the queue and performs

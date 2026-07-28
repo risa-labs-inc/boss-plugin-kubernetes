@@ -45,7 +45,6 @@ class HelmActions(private val services: KubeServices) {
         },
         workingDir = chart.directory.absolutePath,
         location = location,
-        kind = TerminalCommandKind.Mutation,
     )
 
     /**
@@ -101,8 +100,7 @@ class HelmActions(private val services: KubeServices) {
             },
             workingDir = chart?.directory?.absolutePath ?: services.context.projectPath,
             location = location,
-            kind = TerminalCommandKind.Mutation,
-        )
+            )
     }
 
     fun rollback(
@@ -120,7 +118,6 @@ class HelmActions(private val services: KubeServices) {
         },
         workingDir = services.context.projectPath,
         location = location,
-        kind = TerminalCommandKind.Mutation,
     )
 
     fun uninstall(
@@ -138,7 +135,6 @@ class HelmActions(private val services: KubeServices) {
         },
         workingDir = services.context.projectPath,
         location = location,
-        kind = TerminalCommandKind.Mutation,
     )
 
     fun test(release: ReleaseInfo, location: OpenLocation = OpenLocation.NEW_TAB): Boolean = runHelmTerminal(

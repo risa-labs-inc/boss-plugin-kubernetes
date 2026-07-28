@@ -370,7 +370,11 @@ class HelmMcpToolProvider(
                     )
                 }
                 if (actions.install(chart, release, valuesFile)) {
-                    McpToolResult("Installing ${chart.name} as $release into ${target()} in a terminal tab.")
+                    McpToolResult(
+                        "Installing ${chart.name} as $release into ${target()} in the plugin's " +
+                            "terminal tab. Issuing another command interrupts it, and interrupting " +
+                            "a --wait leaves the release pending — confirm with helm_releases.",
+                    )
                 } else {
                     McpToolResult("Couldn't open a terminal tab.", isError = true)
                 }
@@ -379,8 +383,10 @@ class HelmMcpToolProvider(
 
         McpToolDefinition.withRbac(
             name = "helm_upgrade",
-            description = "Upgrade a release, in a terminal tab. chart may be a local path or a repo ref " +
-                "like metrics-server/metrics-server.",
+            description = "Upgrade a release, in the plugin's shared terminal tab. chart may be a " +
+                "local path or a repo ref like metrics-server/metrics-server. Issuing another " +
+                "kubectl or helm command interrupts it; interrupting a --wait leaves the release " +
+                "in pending-upgrade, so confirm with helm_releases rather than assuming.",
             inputSchema = """
                 {"type":"object","properties":{
                   "release":{"type":"string","description":"Release name"},
@@ -408,7 +414,11 @@ class HelmMcpToolProvider(
                     rollbackOnFailure = args.boolean("rollback_on_failure") ?: false,
                 )
                 if (launched) {
-                    McpToolResult("Upgrading $release in ${target()} in a terminal tab.")
+                    McpToolResult(
+                        "Upgrading $release in ${target()} in the plugin's terminal tab. Issuing " +
+                            "another command interrupts it, and interrupting a --wait leaves the " +
+                            "release pending — confirm with helm_releases.",
+                    )
                 } else {
                     McpToolResult("Couldn't open a terminal tab.", isError = true)
                 }
@@ -460,7 +470,10 @@ class HelmMcpToolProvider(
                 val release = helm.findRelease(name)
                     ?: return@McpToolHandler McpToolResult("No release named '$name' in ${target()}.", isError = true)
                 if (actions.uninstall(release, args.boolean("keep_history") ?: false)) {
-                    McpToolResult("Uninstalling $name from ${target()} in a terminal tab.")
+                    McpToolResult(
+                        "Uninstalling $name from ${target()} in the plugin's terminal tab. Issuing " +
+                            "another command interrupts it — confirm with helm_releases.",
+                    )
                 } else {
                     McpToolResult("Couldn't open a terminal tab.", isError = true)
                 }
