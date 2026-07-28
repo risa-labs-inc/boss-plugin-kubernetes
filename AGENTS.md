@@ -112,8 +112,11 @@ The sequence is `switchToTab` → **`sendInterrupt`** → 500 ms → `sendComman
 terminal-tab does for a re-run. The interrupt is not cosmetic: `sendCommand` writes to the pty,
 so with a foreground process still running (a `helm install --wait`, an `exec -it`) the text goes
 to *that process's stdin* and never runs, while the caller still gets `true` and reports success
-for a command that vanished. The API exposes no idle/running signal, so interrupting is the only
-way to guarantee the shell is the reader. Safe here because the tab only ever holds this plugin's
+for a command that vanished. The API exposes no idle/running signal, so interrupting is the
+best available way to *make it likely* the shell is the reader — it narrows the window, it does
+not close it. A process that survives both SIGINTs (a `kubectl apply` blocked on a slow API
+server, a pager, a password prompt) still receives the text, and `sendCommand` returning true
+means "written to the pty", not "the shell read it". Safe here because the tab only ever holds this plugin's
 own commands. What that costs is said **prospectively** — the `helm_*` tools name it, including
 that interrupting a `--wait` leaves the release pending — rather than by a notification after the
 fact: with no liveness signal there is nothing to gate one on, so every guard written for one was

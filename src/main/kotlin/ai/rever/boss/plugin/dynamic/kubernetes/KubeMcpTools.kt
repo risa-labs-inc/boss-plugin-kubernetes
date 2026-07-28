@@ -344,10 +344,10 @@ class KubeMcpToolProvider(
                 if (services.actions.apply(artifact, dryRun = dryRun)) {
                     McpToolResult(
                         "${if (dryRun) "Dry-run applying" else "Applying"} ${file.absolutePath} " +
-                            "to ${engine.target.display()} in a terminal tab.",
+                            "to ${engine.target.display()} in the plugin terminal tab — queued, so check the tab for the result.",
                     )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
                 }
             },
         ),
@@ -383,7 +383,7 @@ class KubeMcpToolProvider(
                 if (opened) {
                     McpToolResult("Opened a shell in $podName (${engine.target.display()}).")
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
                 }
             },
         ),

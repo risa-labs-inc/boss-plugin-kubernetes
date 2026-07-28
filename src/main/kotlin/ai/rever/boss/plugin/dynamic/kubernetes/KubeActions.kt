@@ -381,7 +381,7 @@ class KubeActions(private val services: KubeServices) {
             // owned one: it cannot be interrupted out of, so sharing would strand
             // every later command inside it. See [TerminalCommandKind.Interactive].
             queued.kind == TerminalCommandKind.Interactive ->
-                createSideTab(api, tabs, queued.command, queued.workingDir)
+                createSideTab(api, tabs, full)
 
             else -> {
                 val owned = liveOwnedTerminal(api, tabs)
@@ -576,14 +576,17 @@ class KubeActions(private val services: KubeServices) {
         api: TerminalTabPluginAPI,
         tabs: List<ActiveTabData>,
         command: String,
-        dir: String?,
     ): Boolean {
         val host = findTerminalHost(api, tabs) ?: return false
         val tabId = runCatching {
             api.createTab(
                 windowId = host.windowId,
                 terminalId = host.tabId,
-                workingDirectory = dir,
+                // Same as createOwnedTab: `command` carries its own cd rather than
+                // trusting createTab's workingDirectory, so both paths agree. Today the
+                // only Interactive command is `exec -it`, where cwd never reaches the
+                // pod and this is moot — but the next one inherits whichever choice is
+                // made here, so it may as well inherit the safe one.
                 initialCommand = command,
             )
         }.getOrNull() ?: return false
@@ -628,11 +631,15 @@ class KubeActions(private val services: KubeServices) {
      * new BOSS tab in the window the operator is actually looking at is the less
      * surprising outcome.
      */
-    private fun findTerminalHost(api: TerminalTabPluginAPI, tabs: List<ActiveTabData>): ai.rever.boss.plugin.api.ActiveTabData? {
+    private fun findTerminalHost(api: TerminalTabPluginAPI, tabs: List<ActiveTabData>): ActiveTabData? {
         val myWindow = services.context.windowId
-        return tabs.firstOrNull {
-            it.windowId == myWindow && runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false)
+        val hosts = tabs.filter {
+            runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false)
         }
+        return hosts.firstOrNull { it.windowId == myWindow }
+            ?: hosts.firstOrNull()?.also {
+                log("No terminal in window $myWindow; using one in ${it.windowId}")
+            }
     }
 
     /**
