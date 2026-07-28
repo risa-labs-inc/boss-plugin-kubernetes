@@ -48,6 +48,7 @@ class KubeServices(val context: PluginContext) {
     fun start() {
         engine.start()
         helm.start()
+        actions.start()
         scope.launch {
             // Restore the selection and pinned CRDs before the first render, so the
             // panel doesn't flash the wrong namespace.
@@ -65,6 +66,7 @@ class KubeServices(val context: PluginContext) {
 
     fun dispose() {
         forwards.dispose()
+        actions.dispose()
         helm.dispose()
         engine.dispose()
         scope.cancel()
