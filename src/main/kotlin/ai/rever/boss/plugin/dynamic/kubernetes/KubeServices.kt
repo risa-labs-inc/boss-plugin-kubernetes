@@ -66,10 +66,13 @@ class KubeServices(val context: PluginContext) {
 
     fun dispose() {
         forwards.dispose()
-        actions.dispose()
         helm.dispose()
         engine.dispose()
+        // Before actions.dispose(): that drains the queue to report what was lost, and
+        // with the consumer still alive the two race — the count under-reports and an
+        // item the consumer wins is delivered mid-teardown.
         scope.cancel()
+        actions.dispose()
     }
 
     /** Open (or focus) the Helm release tab for [release]. */

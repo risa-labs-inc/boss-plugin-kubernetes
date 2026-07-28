@@ -114,8 +114,10 @@ so with a foreground process still running (a `helm install --wait`, an `exec -i
 to *that process's stdin* and never runs, while the caller still gets `true` and reports success
 for a command that vanished. The API exposes no idle/running signal, so interrupting is the only
 way to guarantee the shell is the reader. Safe here because the tab only ever holds this plugin's
-own commands — and announced with a toast, since it does mean an unrelated command in flight gets
-stopped.
+own commands. What that costs is said **prospectively** — the `helm_*` tools name it, including
+that interrupting a `--wait` leaves the release pending — rather than by a notification after the
+fact: with no liveness signal there is nothing to gate one on, so every guard written for one was
+either vacuous or fired on every command (boss-plugins#11).
 
 **`kubectl exec -it` never shares the tab.** Ctrl-C is not a universal "stop that": under
 `exec -it` kubectl holds the local terminal in raw mode and *forwards* 0x03 to the remote
@@ -138,7 +140,7 @@ command and became noise (boss-plugins#11).
 
 **No API-version floor was raised for the terminal reuse.** Everything it uses predates the
 declared `minApiVersion` 1.0.48: `getPluginAPI`, `PluginContext.windowId`, `ActiveTabData.windowId`,
-`hasTerminalState` and `sendInterrupt` land in `boss-plugin-api` **1.0.16**, and
+`hasTerminalState`, `sendCommand` and `sendInterrupt` land in `boss-plugin-api` **1.0.16**, and
 `TerminalTabPluginAPI` / `createTab` / `switchToTab` / `listTabs` in **1.0.23**. The
 `runCatching { Throwable }` wrap is not the compatibility contract — it is there for the case that
 terminal-tab simply is not loaded, which logs rather than degrading in silence.

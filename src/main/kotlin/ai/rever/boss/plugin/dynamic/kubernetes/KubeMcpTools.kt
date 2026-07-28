@@ -317,7 +317,9 @@ class KubeMcpToolProvider(
 
         McpToolDefinition(
             name = "k8s_apply",
-            description = "Apply a manifest or kustomization in a BOSS terminal tab. Use dry_run=true first " +
+            description = "Apply a manifest or kustomization in the plugin's shared terminal tab. " +
+                "Another terminal-routed command (apply, diff, or a helm mutation) interrupts it; " +
+                "the read tools do not, so confirming with k8s_get is safe. Use dry_run=true first " +
                 "to see what would change without changing it.",
             inputSchema = """
                 {"type":"object","properties":{
@@ -352,7 +354,9 @@ class KubeMcpToolProvider(
 
         McpToolDefinition(
             name = "k8s_exec",
-            description = "Open an interactive shell in a pod, in a BOSS terminal tab (exec -it needs a real TTY).",
+            description = "Open an interactive shell in a pod, in its own terminal tab (exec -it needs " +
+                "a real TTY, and Ctrl-C is forwarded into the pod rather than freeing the tab, so it " +
+                "never shares the plugin's shared one).",
             inputSchema = """
                 {"type":"object","properties":{
                   "pod":{"type":"string","description":"Pod name"},
