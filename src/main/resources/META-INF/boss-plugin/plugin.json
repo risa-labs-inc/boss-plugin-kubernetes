@@ -1,0 +1,32 @@
+{
+  "manifestVersion": 1,
+  "pluginId": "ai.rever.boss.plugin.dynamic.kubernetes",
+  "displayName": "Kubernetes",
+  "version": "1.0.0",
+  "apiVersion": "1.0.48",
+  "minApiVersion": "1.0.48",
+  "minBossVersion": "9.2.35",
+  "mainClass": "ai.rever.boss.plugin.dynamic.kubernetes.KubernetesDynamicPlugin",
+  "type": "mixed",
+  "description": "Manage Kubernetes from the sidebar — workloads, pods, services and the rest of a namespace, with live logs, supervised port-forwards and an inline preview of what a service serves.",
+  "author": "Risa Labs",
+  "url": "https://github.com/risa-labs-inc/boss-plugin-kubernetes",
+  "panel": {
+    "icon": "Hub",
+    "location": "left.bottom",
+    "order": 56,
+    "panelId": "kubernetes-panel",
+    "displayName": "Kubernetes"
+  },
+  "definedPermissions": [
+    {
+      "name": "kubernetes.manage",
+      "description": "Delete, scale and restart Kubernetes resources"
+    }
+  ],
+  "sandbox": {
+    "maxThreads": 12,
+    "maxRestartAttempts": 3,
+    "heartbeatIntervalMs": 5000
+  }
+}
