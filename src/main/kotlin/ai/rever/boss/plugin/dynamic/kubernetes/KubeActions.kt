@@ -99,11 +99,11 @@ class KubeActions(private val services: KubeServices) {
     /**
      * The terminal tab this plugin owns.
      *
-     * Written **only** by [runTerminalCommands], of which there is exactly one, so no
-     * atomicity is needed. `ownedTerminal` is `@Volatile` because [runInExistingTerminal]
-     * reads it from the caller's thread on the accept path; a stale `null` there only
-     * costs one command a BOSS tab it could have shared, and the consumer re-validates
-     * through [liveOwnedTerminal] regardless. The other two are consumer-only.
+     * Confined to the consumer: [runTerminalCommands] is the only reader and writer, and
+     * there is exactly one of it, so no atomicity or visibility is needed today. (The
+     * accept path used to read it too; that went away when it stopped inspecting
+     * anything.) `@Volatile` is kept as belt-and-braces in case a caller-side read is
+     * ever reintroduced — not because one exists.
      *
      * Kept here rather than on [KubeServices] so that guarantee is structural — a public
      * field on the shared services object is one any future call site can write without
@@ -238,6 +238,11 @@ class KubeActions(private val services: KubeServices) {
      * Falls back to a new BOSS terminal tab when there is no live terminal to join at
      * all, or when the terminal-tab plugin isn't loaded. A terminal in this window is
      * preferred but not required — see [findTerminalHost].
+     *
+     * **Every `NEW_TAB` caller shares one tab and interrupts the others** unless its kind
+     * is [TerminalCommandKind.Interactive]. The `k8s_*` and `helm_*` tool text enumerates
+     * which commands those are; nothing checks that enumeration, so adding a caller means
+     * updating it too.
      */
     fun openTerminal(
         id: String,
@@ -360,10 +365,12 @@ class KubeActions(private val services: KubeServices) {
         val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java)
         val tabs = services.context.activeTabsProvider?.activeTabs?.value
         if (api == null || tabs == null) {
-            // Said out loud rather than swallowed: on a host where the terminal-tab
-            // plugin isn't loaded, this degrades to a BOSS tab per command — the clutter
-            // this path exists to remove — with nothing to explain why.
-            log("No terminal-tab API; opening a BOSS tab for: ${queued.command}")
+            // Said out loud rather than swallowed: this degrades to a BOSS tab per
+            // command — the clutter this path exists to remove — so the reason needs to
+            // be findable. Both causes are real: terminal-tab not loaded, or a host that
+            // supplies no activeTabsProvider. The message names which.
+            val missing = if (api == null) "terminal-tab API" else "activeTabsProvider"
+            log("No $missing; opening a BOSS tab for: ${queued.command}")
             fallBackToBossTab(queued)
             return
         }
@@ -497,29 +504,52 @@ class KubeActions(private val services: KubeServices) {
         // sendCommand take no tabId, so both act on the terminal's *active* tab, and
         // without the switch a Ctrl-C could land on the user's own tab.
         //
+        // Re-asserted before *every* write, not once up front.
+        //
+        // sendInterrupt and sendCommand take no tabId — they hit the terminal's *active*
+        // tab — so the switch is what keeps them off another tab. Asserting it once and
+        // then sleeping 1.2 s would mean acting on a state verified before the sleep, and
+        // the active tab can change inside that window: the user clicking a sub-tab, made
+        // *more* likely because the plugin has just pulled focus to the terminal
+        // mid-work. Here that is worse than a stray build — the neighbouring tab may be
+        // an `exec -it` session, so the command would be typed at a container's shell.
+        //
+        // There is no atomic switch-and-write in the API, so the window cannot be closed;
+        // this shrinks it from 1.2 s to the gap between two adjacent calls, and is free on
+        // the happy path because switchToTabById returns true when the tab is already
+        // active and false only when the id is unknown — the correct bail-out.
+        //
         // Two things verified against BossTerm rather than assumed (compose-ui
         // TabController, as of bossterm-compose 1.2.129):
         //
-        // It is safe from this background thread because BossTerm resolves the target by
+        // Safe from this background thread because BossTerm resolves the target by
         // *reading state*, not by waiting for recomposition: `activeTabIndex` is
         // `by mutableStateOf`, so a write from any thread lands in the global snapshot at
         // once, and `activeTab` is a plain getter over it.
         //
-        // And a `false` here really does mean "no such tab": `switchToTabById` returns
-        // false only when the id is not found, and true when the tab is already active
-        // (the no-op early return is inside the index-based overload it delegates to). So
-        // treating false as fatal cannot misfire on the common already-focused case.
-        if (!runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }.getOrDefault(false)) {
-            return false
-        }
+        // And `false` really does mean "no such tab": the already-active no-op early
+        // return lives in the index-based overload switchToTabById delegates to.
+        suspend fun focusOurTab(): Boolean =
+            runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }
+                .getOrDefault(false)
+
+        if (!focusOurTab()) return false
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(INTERRUPT_ESCALATE_MS)
+        if (!focusOurTab()) return false
         runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
         delay(SHELL_REGAIN_LINE_MS)
+        if (!focusOurTab()) return false
+
         // A command already waiting means this one is superseded the moment it is typed:
         // the consumer returns as soon as sendCommand lands, so the next item's interrupt
-        // fires ~0 ms later and this gets no runway at all. Said where someone debugging
-        // a silent terminal would look.
+        // fires ~0 ms later and this gets no runway at all.
+        //
+        // Logged rather than skipped, deliberately. Dropping looks like the obvious win
+        // and is not, because it is only safe for some commands: a superseded `helm
+        // template` is redundant, but a superseded `helm uninstall` or `kubectl apply`
+        // would be a state change silently skipped, which is worse than a noisy one that
+        // at least starts. Acting on this needs that per-command distinction.
         if (pending.get() > 0) {
             log("Another command is already queued; this one will be interrupted almost immediately")
         }

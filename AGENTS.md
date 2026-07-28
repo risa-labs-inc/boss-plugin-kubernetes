@@ -152,9 +152,10 @@ holds across the interrupt but `launch`es the send does not work — a second co
 then lands before the first has been typed, so the first runs and the second is swallowed, which
 is the original bug one step later. And the sequence must not run on the UI thread: panel clicks
 call `openTerminal` directly, and the body makes cross-plugin calls whose threading contract this
-plugin does not control, so a blocking monitor there risks parking the UI thread. One consumer
-also means `ownedTerminal` needs no `@Volatile` and lives privately in `KubeActions` rather than
-on the shared services object, where any call site could retarget the tab without queueing.
+plugin does not control, so a blocking monitor there risks parking the UI thread. One consumer also means
+`ownedTerminal` is confined to it and lives privately in `KubeActions` rather than on the shared
+services object, where any call site could retarget the tab without queueing; the `@Volatile` on
+it is belt-and-braces for a caller-side read that no longer exists, not a live requirement.
 
 The working directory is never implicit: it defaults to `projectPath`, because on reuse the tab
 sits wherever the last command left it and a relative `-f ./manifest.yaml` would resolve against
