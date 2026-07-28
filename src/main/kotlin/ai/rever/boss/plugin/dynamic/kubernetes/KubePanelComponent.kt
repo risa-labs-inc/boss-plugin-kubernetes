@@ -134,6 +134,13 @@ private fun KubePanelScreen(viewModel: KubePanelViewModel) {
     confirm?.let { ConfirmDialog(viewModel, it) }
     scale?.let { ScaleDialog(viewModel, it) }
     if (crdPicker) CrdPickerDialog(viewModel)
+
+    val install by viewModel.install.collectAsState()
+    val repoAdd by viewModel.repoAdd.collectAsState()
+    val output by viewModel.output.collectAsState()
+    install?.let { InstallDialog(viewModel, it) }
+    repoAdd?.let { RepoAddDialog(viewModel, it) }
+    output?.let { OutputDialog(viewModel, it) }
 }
 
 @Composable
@@ -345,6 +352,11 @@ private fun KubeLists(viewModel: KubePanelViewModel) {
     val customRows by viewModel.customRows.collectAsState()
     val forwards by viewModel.forwards.collectAsState()
 
+    val charts by viewModel.charts.collectAsState()
+    val releases by viewModel.releases.collectAsState()
+    val repos by viewModel.repos.collectAsState()
+    val helmState by viewModel.helmState.collectAsState()
+
     val shownManifests = manifests.filter { viewModel.matches(it.relativePath) }
     val shownWorkloads = workloads.filter { viewModel.matches(it.name) }
     val shownPods = pods.filter { viewModel.matches(it.name) }
@@ -368,6 +380,44 @@ private fun KubeLists(viewModel: KubePanelViewModel) {
                         RowAction("Apply…") { viewModel.apply(artifact) },
                         RowAction("Dry-run apply") { viewModel.applyDryRun(artifact) },
                         RowAction("Diff") { viewModel.diff(artifact) },
+                    ),
+                )
+            }
+        }
+
+        // Helm charts are project artifacts, so they live in Project rather than
+        // earning a section of their own.
+        val shownCharts = charts.filter { viewModel.matches(it.relativePath) || viewModel.matches(it.name) }
+        if (KubeSection.PROJECT in expanded && shownCharts.isNotEmpty()) {
+            items(shownCharts, key = { "chart-" + it.chartFile.absolutePath }) { chart ->
+                RowShell(
+                    title = chart.relativePath.removeSuffix("/Chart.yaml").removeSuffix("Chart.yaml").trimEnd('/'),
+                    subtitle = listOfNotNull(
+                        "helm chart",
+                        chart.version.takeIf { it.isNotBlank() },
+                        "${chart.valuesFiles.size} values files".takeIf { chart.valuesFiles.isNotEmpty() },
+                    ).joinToString(" · "),
+                    leading = {
+                        Icon(
+                            imageVector = HelmIcon,
+                            contentDescription = null,
+                            tint = BossThemeColors.TextMuted,
+                            modifier = Modifier.size(10.dp),
+                        )
+                    },
+                    trailing = {
+                        IconTool(
+                            icon = Icons.Outlined.PlayArrow,
+                            description = "Install",
+                            tint = BossThemeColors.AccentColor,
+                        ) { viewModel.beginInstall(chart) }
+                    },
+                    actions = listOf(
+                        RowAction("Install…") { viewModel.beginInstall(chart) },
+                        RowAction("Lint") { viewModel.lint(chart) },
+                        RowAction("Template (redacted)") { viewModel.template(chart) },
+                        RowAction("Update dependencies") { viewModel.dependencyUpdate(chart) },
+                        RowAction("Package") { viewModel.packageChart(chart) },
                     ),
                 )
             }
@@ -530,6 +580,64 @@ private fun KubeLists(viewModel: KubePanelViewModel) {
                         RowAction("Delete", destructive = true) {
                             viewModel.delete("PersistentVolumeClaim", pvc.name)
                         },
+                    ),
+                )
+            }
+        }
+
+        section(KubeSection.RELEASES, releases.size, expanded, viewModel) {
+            if (helmState is HelmState.Missing) {
+                item { HintRow("helm isn't installed — install it to manage releases") }
+            } else if (releases.isEmpty()) {
+                item { HintRow("No Helm releases in this namespace") }
+            }
+            items(releases.filter { viewModel.matches(it.name) || viewModel.matches(it.chart) }, key = { it.name }) { release ->
+                RowShell(
+                    title = release.name,
+                    subtitle = listOf("rev ${release.revision}", release.status, release.chart).joinToString(" · "),
+                    onClick = { viewModel.openRelease(release) },
+                    leading = {
+                        StatusDot(
+                            healthy = release.isDeployed,
+                            warning = release.isPending || !release.isFailed,
+                        )
+                    },
+                    actions = listOf(
+                        RowAction("Open") { viewModel.openRelease(release) },
+                        RowAction("Upgrade") { viewModel.upgradeRelease(release) },
+                        RowAction("Roll back") { viewModel.rollbackRelease(release) },
+                        RowAction("Run tests") { viewModel.testRelease(release) },
+                        RowAction("Uninstall", destructive = true) { viewModel.uninstallRelease(release) },
+                    ),
+                )
+            }
+        }
+
+        section(KubeSection.REPOS, repos.size, expanded, viewModel) {
+            item {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(start = 22.dp, end = 8.dp, bottom = 2.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    TextButton(onClick = viewModel::beginRepoAdd) {
+                        Text("Add repo…", color = BossThemeColors.AccentColor, fontSize = 11.sp)
+                    }
+                    TextButton(onClick = viewModel::updateRepos) {
+                        Text("Update all", color = BossThemeColors.AccentColor, fontSize = 11.sp)
+                    }
+                }
+            }
+            if (helmState is HelmState.Missing) {
+                item { HintRow("helm isn't installed") }
+            } else if (repos.isEmpty()) {
+                item { HintRow("No chart repositories configured") }
+            }
+            items(repos, key = { it.name }) { repo ->
+                RowShell(
+                    title = repo.name,
+                    subtitle = repo.url,
+                    actions = listOf(
+                        RowAction("Remove", destructive = true) { viewModel.removeRepo(repo) },
                     ),
                 )
             }
@@ -836,6 +944,185 @@ private fun CrdPickerDialog(viewModel: KubePanelViewModel) {
         },
         confirmButton = {
             TextButton(onClick = viewModel::closeCrdPicker) {
+                Text("Close", color = BossThemeColors.TextSecondary, fontSize = 12.sp)
+            }
+        },
+    )
+}
+
+@Composable
+private fun InstallDialog(viewModel: KubePanelViewModel, request: InstallRequest) {
+    AlertDialog(
+        onDismissRequest = viewModel::cancelInstall,
+        backgroundColor = BossThemeColors.SurfaceColor,
+        title = { Text("Install ${request.chart.name}", color = BossThemeColors.TextPrimary, fontSize = 14.sp) },
+        text = {
+            Column {
+                Text(
+                    text = request.chart.relativePath,
+                    color = BossThemeColors.TextMuted,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+                Spacer(Modifier.height(12.dp))
+                Row(verticalAlignment = Alignment.CenterVertically) {
+                    Text(
+                        "Release",
+                        color = BossThemeColors.TextSecondary,
+                        fontSize = 12.sp,
+                        modifier = Modifier.width(80.dp),
+                    )
+                    BasicTextField(
+                        value = request.releaseName,
+                        onValueChange = { viewModel.updateInstall(releaseName = it.lowercase().take(53)) },
+                        singleLine = true,
+                        textStyle = TextStyle(
+                            color = BossThemeColors.TextPrimary,
+                            fontSize = 12.sp,
+                            fontFamily = FontFamily.Monospace,
+                        ),
+                        cursorBrush = SolidColor(BossThemeColors.AccentColor),
+                        modifier = Modifier
+                            .width(180.dp)
+                            .background(BossThemeColors.BackgroundColor, RoundedCornerShape(4.dp))
+                            .padding(horizontal = 8.dp, vertical = 6.dp),
+                    )
+                }
+                if (request.chart.valuesFiles.isNotEmpty()) {
+                    Spacer(Modifier.height(10.dp))
+                    Text("Values file", color = BossThemeColors.TextSecondary, fontSize = 12.sp)
+                    Spacer(Modifier.height(4.dp))
+                    request.chart.valuesFiles.forEach { file ->
+                        val selected = file.name == request.valuesFile
+                        Text(
+                            text = (if (selected) "● " else "○ ") + file.name,
+                            color = if (selected) BossThemeColors.AccentColor else BossThemeColors.TextSecondary,
+                            fontSize = 11.sp,
+                            modifier = Modifier
+                                .clickable { viewModel.updateInstall(valuesFile = file.name) }
+                                .padding(vertical = 3.dp),
+                        )
+                    }
+                }
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = "Installs into the selected context and namespace; the confirmation names both.",
+                    color = BossThemeColors.TextMuted,
+                    fontSize = 10.sp,
+                )
+            }
+        },
+        confirmButton = {
+            Row {
+                TextButton(onClick = viewModel::dryRunInstall) {
+                    Text("Dry run", color = BossThemeColors.TextSecondary, fontSize = 12.sp)
+                }
+                TextButton(onClick = viewModel::confirmInstall, enabled = request.isValid) {
+                    Text(
+                        "Install",
+                        color = if (request.isValid) BossThemeColors.AccentColor else BossThemeColors.TextMuted,
+                        fontSize = 12.sp,
+                    )
+                }
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = viewModel::cancelInstall) {
+                Text("Cancel", color = BossThemeColors.TextSecondary, fontSize = 12.sp)
+            }
+        },
+    )
+}
+
+@Composable
+private fun RepoAddDialog(viewModel: KubePanelViewModel, request: RepoAddRequest) {
+    AlertDialog(
+        onDismissRequest = viewModel::cancelRepoAdd,
+        backgroundColor = BossThemeColors.SurfaceColor,
+        title = { Text("Add chart repository", color = BossThemeColors.TextPrimary, fontSize = 14.sp) },
+        text = {
+            Column {
+                LabelledField("Name", request.name) { viewModel.updateRepoAdd(name = it) }
+                Spacer(Modifier.height(8.dp))
+                LabelledField("URL", request.url) { viewModel.updateRepoAdd(url = it) }
+                Spacer(Modifier.height(10.dp))
+                Text(
+                    text = "Writes ~/.config/helm/repositories.yaml — shared with your shells, not just BOSS.",
+                    color = BossThemeColors.TextMuted,
+                    fontSize = 10.sp,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = viewModel::confirmRepoAdd, enabled = request.isValid) {
+                Text(
+                    "Add",
+                    color = if (request.isValid) BossThemeColors.AccentColor else BossThemeColors.TextMuted,
+                    fontSize = 12.sp,
+                )
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = viewModel::cancelRepoAdd) {
+                Text("Cancel", color = BossThemeColors.TextSecondary, fontSize = 12.sp)
+            }
+        },
+    )
+}
+
+@Composable
+private fun LabelledField(label: String, value: String, onChange: (String) -> Unit) {
+    Row(verticalAlignment = Alignment.CenterVertically) {
+        Text(label, color = BossThemeColors.TextSecondary, fontSize = 12.sp, modifier = Modifier.width(56.dp))
+        BasicTextField(
+            value = value,
+            onValueChange = onChange,
+            singleLine = true,
+            textStyle = TextStyle(
+                color = BossThemeColors.TextPrimary,
+                fontSize = 12.sp,
+                fontFamily = FontFamily.Monospace,
+            ),
+            cursorBrush = SolidColor(BossThemeColors.AccentColor),
+            modifier = Modifier
+                .width(260.dp)
+                .background(BossThemeColors.BackgroundColor, RoundedCornerShape(4.dp))
+                .padding(horizontal = 8.dp, vertical = 6.dp),
+        )
+    }
+}
+
+/**
+ * Read-only output (lint, template, dry run).
+ *
+ * Rendered manifests deliberately land here rather than in a terminal: they can
+ * contain Secret payloads, and this path has already had them redacted.
+ */
+@Composable
+private fun OutputDialog(viewModel: KubePanelViewModel, request: OutputRequest) {
+    AlertDialog(
+        onDismissRequest = viewModel::dismissOutput,
+        backgroundColor = BossThemeColors.SurfaceColor,
+        title = {
+            Column {
+                Text(request.title, color = BossThemeColors.TextPrimary, fontSize = 14.sp)
+                if (request.redacted) {
+                    Text("Secret values redacted", color = BossThemeColors.TextMuted, fontSize = 10.sp)
+                }
+            }
+        },
+        text = {
+            Box(Modifier.heightIn(max = 420.dp).verticalScroll(rememberScrollState())) {
+                Text(
+                    text = request.body.ifBlank { "(no output)" },
+                    color = BossThemeColors.TextSecondary,
+                    fontSize = 11.sp,
+                    fontFamily = FontFamily.Monospace,
+                )
+            }
+        },
+        confirmButton = {
+            TextButton(onClick = viewModel::dismissOutput) {
                 Text("Close", color = BossThemeColors.TextSecondary, fontSize = 12.sp)
             }
         },

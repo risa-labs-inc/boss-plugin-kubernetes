@@ -32,17 +32,24 @@ preview backed by a supervised port-forward, describe, YAML and events.
 ## Architecture
 
 ```
-KubectlCli.kt               → only place that shells out; binary resolution + exec/stream
+KubectlCli.kt               → only place that shells out to kubectl; resolution + exec/stream
 KubeModels.kt               → models from `-o json` .items[]; SecretInfo has NO data field
 KubeEngine.kt               → ClusterState, contexts/namespaces, per-section watches, project scan
-KubeServices.kt             → shared brain: engine, forwards, actions, storage, verified tab open
+KubeServices.kt             → shared brain: engines, forwards, actions, storage, verified tab open
 PortForwardManager.kt       → supervised `kubectl port-forward` with restart + ceiling
-KubeActions.kt              → apply/diff/exec → terminal tab; delete/scale/restart in-plugin
-KubePanelInfo/ViewModel/Component.kt → sidebar (context+namespace header, 10 sections)
+KubeActions.kt              → terminal-tab routing; delete/scale/restart in-plugin
+KubePanelInfo/ViewModel/Component.kt → sidebar (context+namespace header, 12 sections)
 KubeResourceTab*.kt         → tab type, VM and UI: Logs | Preview | Describe | YAML | Events
 KubeMcpTools.kt             → k8s_* MCP tools
 KubeIcon.kt                 → SimpleIcons.Kubernetes alias
 KubernetesDynamicPlugin.kt  → register/dispose
+
+HelmCli.kt                  → only place that shells out to helm; version + flag dialect
+HelmModels.kt               → release/revision/repo/chart models + redactRenderedYaml
+HelmEngine.kt               → releases, repos, chart discovery; companion to KubeEngine
+HelmActions.kt              → install/upgrade/rollback/uninstall/test/package/push/repo ops
+HelmReleaseTab*.kt          → tab type, VM and UI: Status | Values | Manifest | History | Notes
+HelmMcpTools.kt             → helm_* MCP tools (second provider, independent of helm's absence)
 ```
 
 ### Load-bearing decisions
@@ -92,6 +99,54 @@ in-plugin and toast.
 is the difference between a routine delete and an incident. There are deliberately **no bulk or
 cascade helpers** — no delete-all, no prune, no delete-namespace.
 
+### Helm specifics
+
+**Every command reuses one plugin-owned terminal tab.** `KubeActions.openTerminal` first tries
+`runInExistingTerminal`, which reuses the tab recorded in `KubeServices.commandTerminal`
+(`switchToTab` then `sendCommand`), creating it only once. Two things it must not do: open a tab
+per command (the strip fills within minutes), or send into whatever tab is focused —
+`sendCommand` writes to the terminal's *active* tab, so without an owned tab a `helm upgrade`
+would be typed into the user's own shell session. Opening a fresh BOSS tab is the last resort.
+
+**Helm 4 removed and renamed CLI surface**, all verified against 4.2.3 rather than assumed:
+
+- `helm list --all` **no longer exists**. Use the per-state flags
+  (`--deployed --failed --pending --uninstalling`), which exist in Helm 3 too, so no dialect
+  switch is needed. `--superseded` is left out on purpose: it returns every historical revision.
+- `--atomic` → `--rollback-on-failure`, `--force` → `--force-replace`. `HelmCli` picks by major
+  version so both 3 and 4 work.
+- `helm version --client` is removed; probe with `--template '{{.Version}}'`.
+- `--wait` is now a WaitStrategy (`watcher|hookOnly|legacy`), not a boolean, and `watcher` needs
+  the `watch` RBAC verb.
+- `helm push` speaks HTTPS by default — a non-TLS registry needs `--plain-http`, or it fails
+  with "server gave HTTP response to HTTPS client".
+- `helm list -o json` returns a **bare array**, unlike kubectl's `{"items":[…]}`, and `revision`
+  is a **String** there but an **Int** in `helm history -o json` (with different `updated`
+  formats). Hence separate `RawRelease`/`RawRevision` types — one shared model fails to decode.
+
+**Three paths render manifests, and all three are redacted or withheld:**
+
+- `helm get manifest` → `redactRenderedYaml`
+- `helm template` → same
+- `helm install --dry-run` → runs **in-plugin**, not in a terminal, precisely because its output
+  embeds the manifest; sending it to a terminal would put secret values in scrollback
+- `helm status -o json` embeds the manifest too, so `RawStatus` deliberately has no `manifest`
+  field and the Status view says where to find it instead
+
+Chart *values* are **not** redacted — they are the user's own input, and hiding what you
+configured would break the view. Only rendered `kind: Secret` objects are.
+
+**Repo config is deliberately shared.** `helm repo add/update/remove` uses the default
+`~/.config/helm/repositories.yaml`, unlike the kubeconfig which is never written: a context
+selection is transient and must not retarget other shells, whereas a chart repo is a persistent
+registration you want everywhere. Every repo mutation confirms and says it affects the machine.
+
+**Release reads require helm *and* a reachable cluster.** `requireReleaseAccess()` checks both,
+because helm-installed-but-cluster-down makes `helm list` return nothing, and an unguarded
+handler then answers "No Helm releases" — which reads as "nothing installed" when the truth is
+"I can't see". Local-only tools (charts, lint, template, repos, package) stay usable when the
+cluster is down.
+
 ### Known host gap (not fixable from here)
 
 `DynamicPluginManager.disablePlugin` calls `trackingContext.unregisterAll()` but **never calls
@@ -118,11 +173,18 @@ one-line host change (call `dispose()` on disable, or emit `DISABLED`).
 
 ## MCP Tools
 
-`k8s_contexts`, `k8s_use_context`, `k8s_namespaces`, `k8s_pods`, `k8s_get`, `k8s_logs`,
-`k8s_describe`, `k8s_yaml`, `k8s_events`, `k8s_api_resources`, `k8s_port_forward`,
+kubectl side: `k8s_contexts`, `k8s_use_context`, `k8s_namespaces`, `k8s_pods`, `k8s_get`,
+`k8s_logs`, `k8s_describe`, `k8s_yaml`, `k8s_events`, `k8s_api_resources`, `k8s_port_forward`,
 `k8s_port_forward_stop`, `k8s_forwards`, `k8s_manifests`, `k8s_apply`, `k8s_exec`,
 `k8s_open_resource`, and the `kubernetes.manage`-gated `k8s_scale`, `k8s_rollout_restart`,
 `k8s_delete`.
+
+Helm side: `helm_releases`, `helm_status`, `helm_values`, `helm_manifest`, `helm_history`,
+`helm_notes`, `helm_charts`, `helm_lint`, `helm_template`, `helm_repos`, `helm_search`,
+`helm_open_release`, `helm_package`, `helm_dependency_update`, `helm_repo_add`,
+`helm_repo_update`, `helm_repo_remove`, plus `kubernetes.manage`-gated `helm_install`,
+`helm_upgrade`, `helm_rollback`, `helm_uninstall`, `helm_test` and `helm.publish`-gated
+`helm_push`.
 
 Every reply names the context and namespace it acted on. Gate mutating tools with
 `McpToolDefinition.withRbac(...)` — never `.copy()`, which drops the gate.

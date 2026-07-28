@@ -14,6 +14,31 @@ data class ConfirmRequest(
     val onConfirm: () -> Unit,
 )
 
+/** A pending Helm install the user is filling in. */
+data class InstallRequest(
+    val chart: ChartArtifact,
+    val releaseName: String,
+    val valuesFile: String?,
+) {
+    val isValid: Boolean get() = releaseName.isNotBlank() && RELEASE_NAME.matches(releaseName)
+
+    private companion object {
+        /** Helm release names are DNS-1123 labels. */
+        val RELEASE_NAME = Regex("^[a-z0-9]([-a-z0-9]*[a-z0-9])?$")
+    }
+}
+
+/** A pending chart repository addition. */
+data class RepoAddRequest(val name: String, val url: String) {
+    val isValid: Boolean get() = name.isNotBlank() && (url.startsWith("http") || url.startsWith("oci://"))
+}
+
+/**
+ * Read-only text to show in a dialog — lint results, and rendered output that must
+ * not be piped to a terminal because it can contain Secret payloads.
+ */
+data class OutputRequest(val title: String, val body: String, val redacted: Boolean)
+
 /** A pending scale, with the replica count the user is editing. */
 data class ScaleRequest(
     val workload: WorkloadInfo,
@@ -66,6 +91,22 @@ class KubePanelViewModel(private val services: KubeServices) {
     private val _crdPickerOpen = MutableStateFlow(false)
     val crdPickerOpen: StateFlow<Boolean> = _crdPickerOpen.asStateFlow()
 
+    // ------------------------------------------------------------------ helm
+
+    val helmState: StateFlow<HelmState> = services.helm.helm
+    val releases: StateFlow<List<ReleaseInfo>> = services.helm.releases
+    val repos: StateFlow<List<RepoInfo>> = services.helm.repos
+    val charts: StateFlow<List<ChartArtifact>> = services.helm.charts
+
+    private val _install = MutableStateFlow<InstallRequest?>(null)
+    val install: StateFlow<InstallRequest?> = _install.asStateFlow()
+
+    private val _repoAdd = MutableStateFlow<RepoAddRequest?>(null)
+    val repoAdd: StateFlow<RepoAddRequest?> = _repoAdd.asStateFlow()
+
+    private val _output = MutableStateFlow<OutputRequest?>(null)
+    val output: StateFlow<OutputRequest?> = _output.asStateFlow()
+
     init {
         // Start the two default-open sections watching immediately.
         _expanded.value.forEach { engine.setSectionActive(it, true) }
@@ -81,12 +122,237 @@ class KubePanelViewModel(private val services: KubeServices) {
         val nowExpanded = section !in _expanded.value
         _expanded.update { if (nowExpanded) it + section else it - section }
         engine.setSectionActive(section, nowExpanded)
+        // Helm has no watch API, so expanding a Helm section is the cue to fetch.
+        if (nowExpanded) {
+            when (section) {
+                KubeSection.RELEASES -> scope.launch { services.helm.refreshReleases() }
+                KubeSection.REPOS -> scope.launch { services.helm.refreshRepos() }
+                KubeSection.PROJECT -> services.helm.rescanCharts()
+                else -> Unit
+            }
+        }
     }
 
     fun refresh() {
         engine.rescanProject()
         engine.requestRefresh()
-        scope.launch { engine.refreshContexts(); engine.refreshNamespaces() }
+        services.helm.rescanCharts()
+        scope.launch {
+            engine.refreshContexts()
+            engine.refreshNamespaces()
+            services.helm.refreshReleases()
+            services.helm.refreshRepos()
+        }
+    }
+
+    // ------------------------------------------------------------ helm: charts
+
+    fun beginInstall(chart: ChartArtifact) {
+        _install.value = InstallRequest(
+            chart = chart,
+            releaseName = chart.suggestedRelease,
+            valuesFile = chart.valuesFiles.firstOrNull()?.name,
+        )
+    }
+
+    fun updateInstall(releaseName: String? = null, valuesFile: String? = null) {
+        _install.update { current ->
+            current?.copy(
+                releaseName = releaseName ?: current.releaseName,
+                valuesFile = valuesFile ?: current.valuesFile,
+            )
+        }
+    }
+
+    fun cancelInstall() {
+        _install.value = null
+    }
+
+    fun confirmInstall() {
+        val request = _install.value ?: return
+        if (!request.isValid) return
+        _install.value = null
+        askConfirm(
+            title = "Install ${request.releaseName}?",
+            message = "Installs ${request.chart.name} into ${services.helmActions.describeTarget()}" +
+                (request.valuesFile?.let { " using $it" } ?: "") + ".",
+            confirmLabel = "Install",
+        ) {
+            val ok = services.helmActions.install(
+                chart = request.chart,
+                releaseName = request.releaseName,
+                valuesFile = request.chart.valuesFileNamed(request.valuesFile),
+            )
+            if (ok) services.toastInfo("Installing ${request.releaseName}…")
+        }
+    }
+
+    /** Dry run stays in-plugin: its output is a rendered manifest. */
+    fun dryRunInstall() {
+        val request = _install.value ?: return
+        _install.value = null
+        scope.launch {
+            val (ok, body) = services.helmActions.installDryRun(
+                chart = request.chart,
+                releaseName = request.releaseName,
+                valuesFile = request.chart.valuesFileNamed(request.valuesFile),
+            )
+            _output.value = OutputRequest("Dry run: ${request.releaseName}", body, redacted = ok)
+        }
+    }
+
+    fun lint(chart: ChartArtifact, valuesFile: String? = null) {
+        scope.launch {
+            val result = services.helmActions.lint(chart, chart.valuesFileNamed(valuesFile))
+            _output.value = OutputRequest(
+                title = "Lint: ${chart.name}",
+                body = result.stdout.ifBlank { result.cleanError },
+                redacted = false,
+            )
+        }
+    }
+
+    fun template(chart: ChartArtifact, valuesFile: String? = null) {
+        scope.launch {
+            val (ok, body) = services.helmActions.template(
+                chart,
+                chart.suggestedRelease,
+                chart.valuesFileNamed(valuesFile),
+            )
+            _output.value = OutputRequest("Template: ${chart.name}", body, redacted = ok)
+        }
+    }
+
+    fun dependencyUpdate(chart: ChartArtifact) {
+        if (services.helmActions.dependencyUpdate(chart)) {
+            services.toastInfo("Updating dependencies for ${chart.name}…")
+        }
+    }
+
+    fun packageChart(chart: ChartArtifact) {
+        val dest = chart.directory.parent ?: chart.directory.absolutePath
+        if (services.helmActions.packageChart(chart, dest)) {
+            services.toastInfo("Packaging ${chart.name} into $dest…")
+        }
+    }
+
+    fun dismissOutput() {
+        _output.value = null
+    }
+
+    fun outputText(): String = _output.value?.body.orEmpty()
+
+    // ---------------------------------------------------------- helm: releases
+
+    fun openRelease(release: ReleaseInfo) = services.openReleaseTab(release.name)
+
+    fun upgradeRelease(release: ReleaseInfo) {
+        // Upgrading needs a chart; use the project chart whose name matches, else
+        // ask the user to drive it from the chart row instead of guessing.
+        val chart = charts.value.firstOrNull { it.name == release.chartName }
+        if (chart == null) {
+            services.toastError("No project chart named '${release.chartName}' — upgrade from the chart row.")
+            return
+        }
+        askConfirm(
+            title = "Upgrade ${release.name}?",
+            message = "Upgrades ${release.name} in ${services.helmActions.describeTarget()} from ${chart.relativePath}.",
+            confirmLabel = "Upgrade",
+        ) {
+            if (services.helmActions.upgrade(
+                    chart = chart,
+                    releaseName = release.name,
+                    valuesFile = chart.valuesFiles.firstOrNull(),
+                    rollbackOnFailure = true,
+                )
+            ) {
+                services.toastInfo("Upgrading ${release.name}…")
+            }
+        }
+    }
+
+    fun rollbackRelease(release: ReleaseInfo) {
+        val previous = (release.revision - 1).coerceAtLeast(1)
+        askConfirm(
+            title = "Roll ${release.name} back to $previous?",
+            message = "Rolls ${release.name} in ${services.helmActions.describeTarget()} back to revision " +
+                "$previous. Open the release tab to pick a different revision.",
+            confirmLabel = "Roll back",
+        ) {
+            if (services.helmActions.rollback(release, previous)) {
+                services.toastInfo("Rolling ${release.name} back…")
+            }
+        }
+    }
+
+    fun uninstallRelease(release: ReleaseInfo) {
+        askConfirm(
+            title = "Uninstall ${release.name}?",
+            message = "Deletes every object ${release.name} owns from " +
+                "${services.helmActions.describeTarget()}. This cannot be undone.",
+            confirmLabel = "Uninstall",
+        ) {
+            if (services.helmActions.uninstall(release)) {
+                services.toastInfo("Uninstalling ${release.name}…")
+            }
+        }
+    }
+
+    fun testRelease(release: ReleaseInfo) {
+        if (services.helmActions.test(release)) services.toastInfo("Running tests for ${release.name}…")
+    }
+
+    // ------------------------------------------------------------- helm: repos
+
+    fun beginRepoAdd() {
+        _repoAdd.value = RepoAddRequest("", "")
+    }
+
+    fun updateRepoAdd(name: String? = null, url: String? = null) {
+        _repoAdd.update { it?.copy(name = name ?: it.name, url = url ?: it.url) }
+    }
+
+    fun cancelRepoAdd() {
+        _repoAdd.value = null
+    }
+
+    fun confirmRepoAdd() {
+        val request = _repoAdd.value ?: return
+        if (!request.isValid) return
+        _repoAdd.value = null
+        askConfirm(
+            title = "Add repo ${request.name}?",
+            // Unlike context selection, this writes shared config — say so.
+            message = "Adds ${request.url} to ~/.config/helm/repositories.yaml. This affects the whole " +
+                "machine, including your shells — not just BOSS.",
+            confirmLabel = "Add",
+        ) {
+            if (services.helmActions.repoAdd(request.name, request.url)) {
+                services.toastInfo("Adding repo ${request.name}…")
+            }
+        }
+    }
+
+    fun updateRepos() {
+        if (services.helmActions.repoUpdate()) services.toastInfo("Updating chart repositories…")
+    }
+
+    fun removeRepo(repo: RepoInfo) {
+        askConfirm(
+            title = "Remove repo ${repo.name}?",
+            message = "Removes ${repo.name} from ~/.config/helm/repositories.yaml — machine-wide, not just BOSS.",
+            confirmLabel = "Remove",
+        ) {
+            scope.launch {
+                val result = services.helmActions.repoRemove(repo.name)
+                services.helm.refreshRepos()
+                if (result.ok) {
+                    services.toastSuccess("Removed repo ${repo.name}")
+                } else {
+                    services.toastError(result.cleanError.take(200))
+                }
+            }
+        }
     }
 
     fun matches(text: String): Boolean {
