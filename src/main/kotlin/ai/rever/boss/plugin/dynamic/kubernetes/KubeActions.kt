@@ -390,23 +390,26 @@ class KubeActions(private val services: KubeServices) {
         val full = if (queued.workingDir == null) queued.command else "cd ${q(queued.workingDir)} && ${queued.command}"
         var hadOwnTab = false
         val delivered = when {
-            // An interactive session gets its own tab and is never recorded as the
-            // owned one: it cannot be interrupted out of, so sharing would strand
-            // every later command inside it. See [TerminalCommandKind.Interactive].
+            // An interactive session gets its own pty and is never recorded as the owned
+            // one: it cannot be interrupted out of, so sharing would strand every later
+            // command inside it. See [TerminalCommandKind.Interactive]. A bottom split of
+            // the tab we already own when there is one, so it lands beside the plugin's
+            // output rather than in a tab of its own.
             queued.kind == TerminalCommandKind.Interactive ->
-                createSideTab(api, tabs, full)
+                liveOwnedTerminal(api, tabs)?.let { runInBottomSplit(api, it, full) }
+                    ?: createSideTab(api, tabs, full)
 
             // Something is already queued behind this one, so delivering it to the shared
-            // tab would type it and then interrupt it ~0 ms later: killed before it did
-            // anything, with its caller already told it was accepted. A sibling tab costs
-            // one tab *only under contention* — rare by construction, since it means two
-            // commands arrived inside a single delivery — and that is unambiguously better
-            // than losing a `kubectl apply` or a `helm uninstall`. Skipping instead is not
-            // an option: a silently dropped mutation is worse than a noisy one.
-            pending.get() > 0 -> {
-                log("Another command is queued; giving this one its own tab rather than superseding it")
-                createSideTab(api, tabs, full)
-            }
+            // pane would type it and then interrupt it ~0 ms later: killed before it did
+            // anything, with its caller already told it was accepted. A bottom split costs
+            // one pane *only under contention* — rare by construction, since it means two
+            // commands arrived inside a single delivery — and is unambiguously better than
+            // losing a `kubectl apply` or a `helm uninstall`. Skipping instead is not an
+            // option: a silently dropped mutation is worse than a noisy one.
+            pending.get() > 0 && liveOwnedTerminal(api, tabs) != null ->
+                runInBottomSplit(api, liveOwnedTerminal(api, tabs)!!, full).also {
+                    log("Another command is queued; ran this one in a bottom split rather than superseding it")
+                }
 
             else -> {
                 val owned = liveOwnedTerminal(api, tabs)
@@ -581,7 +584,46 @@ class KubeActions(private val services: KubeServices) {
     }
 
     /**
+     * Run [full] in a **bottom split of the tab we already own**, leaving whatever is in
+     * the top pane alone.
+     *
+     * Preferred over another tab: the point of this path is to stay in one tab, so the
+     * operator sees the commands stacked instead of hunting a tab strip. Used both under
+     * contention and for interactive sessions.
+     *
+     * No interrupt, and that is why this exists: the new pane is a fresh shell, so there
+     * is nothing to interrupt and nothing gets superseded. Ownership is unchanged — the
+     * next command still reuses the top pane.
+     *
+     * `splitHorizontal` moves focus to the new pane (BossTerm's `preserveFocus` defaults
+     * to false and the plugin API does not override it), which is what makes
+     * `writeToFocusedPane` land in the split rather than back in the busy pane. That
+     * ordering is load-bearing; the two calls must stay adjacent.
+     */
+    private fun runInBottomSplit(
+        api: TerminalTabPluginAPI,
+        owned: CommandTerminal,
+        full: String,
+    ): Boolean {
+        val pane = runCatching {
+            api.splitHorizontal(owned.windowId, owned.hostTabId, owned.subTabId)
+        }.getOrNull() ?: return false
+        // Raw write, so the newline is ours to add — unlike sendCommand, which appends it.
+        val wrote = runCatching {
+            api.writeToFocusedPane(owned.windowId, owned.hostTabId, "$full\n", owned.subTabId)
+        }.getOrDefault(false)
+        if (wrote) {
+            focusHostTab(owned.hostTabId, owned.windowId)
+        } else {
+            log("Split pane $pane would not take the command")
+        }
+        return wrote
+    }
+
+    /**
      * A tab of its own for a command that must not share one, left unowned.
+     *
+     * The fallback when there is no owned tab yet to split.
      *
      * Interactive sessions are inherently one per session, so a tab each is the right
      * shape rather than a regression toward tab-per-command — and it stays inside the
