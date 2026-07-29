@@ -26,7 +26,6 @@ class KubeServices(val context: PluginContext) {
     val helm = HelmEngine(scope, engine)
     val helmActions = HelmActions(this)
 
-
     private val storage: PluginStorageProvider? by lazy {
         runCatching { context.pluginStorageFactory?.createStorage(PLUGIN_ID) }.getOrNull()
     }
@@ -69,8 +68,10 @@ class KubeServices(val context: PluginContext) {
         helm.dispose()
         engine.dispose()
         // Before actions.dispose(): that drains the queue to report what was lost, and
-        // with the consumer still alive the two race — the count under-reports and an
-        // item the consumer wins is delivered mid-teardown.
+        // with the consumer still alive the two race. This *narrows* the race rather than
+        // closing it — cancellation is cooperative, so a consumer already inside a
+        // non-suspending sendCommand keeps going. (And per the known host gap, dispose()
+        // is not called on plugin *disable* at all, so this path is best-effort anyway.)
         scope.cancel()
         actions.dispose()
     }
@@ -204,8 +205,6 @@ class KubeServices(val context: PluginContext) {
         private const val HELM_SETTLE_MS = 2_500L
     }
 }
-
-/** Identifies the terminal tab the plugin runs its commands in. */
 
 /** What [KubeServices.openResourceTabVerified] observed. */
 enum class TabOpenOutcome {

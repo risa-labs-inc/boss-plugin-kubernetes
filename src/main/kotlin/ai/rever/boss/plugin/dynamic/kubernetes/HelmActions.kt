@@ -100,7 +100,7 @@ class HelmActions(private val services: KubeServices) {
             },
             workingDir = chart?.directory?.absolutePath ?: services.context.projectPath,
             location = location,
-            )
+        )
     }
 
     fun rollback(

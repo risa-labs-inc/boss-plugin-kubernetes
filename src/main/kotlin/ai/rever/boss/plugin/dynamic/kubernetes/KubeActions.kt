@@ -117,6 +117,17 @@ class KubeActions(private val services: KubeServices) {
     /** Commands accepted but not yet taken by the consumer. */
     private val pending = AtomicInteger(0)
 
+    /**
+     * Whether [start] has run.
+     *
+     * Load-bearing enough to assert: with no consumer, `trySend` succeeds forever and
+     * every command is reported launched and never delivered — the exact failure
+     * [terminalCommands] warns about. The wiring is one call away in another class, so
+     * this is checked rather than assumed.
+     */
+    @Volatile
+    private var started = false
+
     /** The plugin has no host logger; this keeps the one prefix in one place. */
     private fun log(message: String) = System.err.println("[Kubernetes] $message")
 
@@ -141,6 +152,7 @@ class KubeActions(private val services: KubeServices) {
      * an accident.
      */
     fun start() {
+        started = true
         services.scope.launch { runTerminalCommands() }
     }
 
@@ -306,6 +318,7 @@ class KubeActions(private val services: KubeServices) {
         kind: TerminalCommandKind,
         onDelivered: (() -> Unit)?,
     ): Boolean {
+        check(started) { "KubeActions.start() was never called; commands would queue and never be delivered" }
         // Never leave the directory implicit. On reuse the tab sits wherever the last
         // command left it, so a null workingDir would run this one in some other
         // project's directory — which for `helm install ./chart` and
@@ -383,11 +396,23 @@ class KubeActions(private val services: KubeServices) {
             queued.kind == TerminalCommandKind.Interactive ->
                 createSideTab(api, tabs, full)
 
+            // Something is already queued behind this one, so delivering it to the shared
+            // tab would type it and then interrupt it ~0 ms later: killed before it did
+            // anything, with its caller already told it was accepted. A sibling tab costs
+            // one tab *only under contention* — rare by construction, since it means two
+            // commands arrived inside a single delivery — and that is unambiguously better
+            // than losing a `kubectl apply` or a `helm uninstall`. Skipping instead is not
+            // an option: a silently dropped mutation is worse than a noisy one.
+            pending.get() > 0 -> {
+                log("Another command is queued; giving this one its own tab rather than superseding it")
+                createSideTab(api, tabs, full)
+            }
+
             else -> {
                 val owned = liveOwnedTerminal(api, tabs)
                 hadOwnTab = owned != null
                 if (owned != null) {
-                    deliverToOwnedTab(api, owned, full, queued.kind)
+                    deliverToOwnedTab(api, owned, full)
                 } else {
                     // `full`, not the bare command: both paths then derive the directory
                     // the same way. Relying on createTab's workingDirectory here instead
@@ -395,7 +420,7 @@ class KubeActions(private val services: KubeServices) {
                     // the *first* command runs in the wrong place and every later one is
                     // right — miserable to debug, and for `kubectl apply -f ./x.yaml` it
                     // is the wrong file, not just the wrong directory.
-                    createOwnedTab(api, tabs, full, queued.kind)
+                    createOwnedTab(api, tabs, full)
                 }
             }
         }
@@ -431,11 +456,11 @@ class KubeActions(private val services: KubeServices) {
         // Guarded as a whole, including the toasts: this runs inside the consumer's catch
         // block, so anything escaping here kills the consumer (see [terminalCommands]).
         // `toastError` reaches the host's notification provider, so it is not exempt.
-        runCatching {
+        val opened = runCatching {
             val ops = services.context.splitViewOperations
             if (ops == null) {
                 services.toastError("No terminal available — run manually: ${queued.command}")
-                return@runCatching
+                return@runCatching false
             }
             ops.openTab(
                 TerminalTabInfo(
@@ -445,14 +470,21 @@ class KubeActions(private val services: KubeServices) {
                     workingDirectory = queued.workingDir,
                 ),
             )
-            // The command does run here, just in its own BOSS tab.
-            queued.onDelivered?.invoke()
+            true
         }.onFailure { failure ->
             log("Terminal fallback failed: $failure")
             runCatching {
                 services.toastError("Couldn't reach the terminal — run manually: ${queued.command}")
             }
-        }
+        }.getOrDefault(false)
+
+        // Outside the block above, and isolated on its own. The command *does* run here,
+        // just in its own BOSS tab — so a throwing callback must not be mistaken for the
+        // open having failed. `installTool`'s callback fires a toast, and conflating the
+        // two would tell the user to run by hand a `brew install` that is already running
+        // *and* leave `watchForTool` unstarted, so the panel stays stuck in its
+        // not-installed state.
+        if (opened) runCatching { queued.onDelivered?.invoke() }
     }
 
     /** Our tab, if it is still open; forgets it and returns null otherwise. */
@@ -516,7 +548,6 @@ class KubeActions(private val services: KubeServices) {
         api: TerminalTabPluginAPI,
         owned: CommandTerminal,
         full: String,
-        kind: TerminalCommandKind,
     ): Boolean {
         // Switch first, and this is what makes the interrupt safe: sendInterrupt and
         // sendCommand take no tabId, so both act on the terminal's *active* tab, and
@@ -537,18 +568,6 @@ class KubeActions(private val services: KubeServices) {
         delay(SHELL_REGAIN_LINE_MS)
         if (!focusOurTab()) return false
 
-        // A command already waiting means this one is superseded the moment it is typed:
-        // the consumer returns as soon as sendCommand lands, so the next item's interrupt
-        // fires ~0 ms later and this gets no runway at all.
-        //
-        // Logged rather than skipped, deliberately. Dropping looks like the obvious win
-        // and is not, because it is only safe for some commands: a superseded `helm
-        // template` is redundant, but a superseded `helm uninstall` or `kubectl apply`
-        // would be a state change silently skipped, which is worse than a noisy one that
-        // at least starts. Acting on this needs that per-command distinction.
-        if (pending.get() > 0) {
-            log("Another command is already queued; this one will be interrupted almost immediately")
-        }
         val sent = runCatching { api.sendCommand(owned.windowId, owned.hostTabId, full) }.getOrDefault(false)
         if (sent) {
             // Deliberately not phrased as "interrupting the previous command": nothing
@@ -567,6 +586,12 @@ class KubeActions(private val services: KubeServices) {
      * Interactive sessions are inherently one per session, so a tab each is the right
      * shape rather than a regression toward tab-per-command — and it stays inside the
      * same BOSS tab, which is what the reuse was for.
+     *
+     * Still goes through the queue rather than bypassing it, even though it makes its own
+     * tab. That is deliberate: this calls `switchToTab` and `focusHostTab`, so running it
+     * concurrently would let it steal the active tab inside [deliverToOwnedTab]'s
+     * switch→write window — exactly what those re-assertions guard against. The cost is
+     * that a "Shell" click waits behind any queued Batch command.
      */
     private fun createSideTab(
         api: TerminalTabPluginAPI,
@@ -596,7 +621,6 @@ class KubeActions(private val services: KubeServices) {
         api: TerminalTabPluginAPI,
         tabs: List<ActiveTabData>,
         command: String,
-        kind: TerminalCommandKind,
     ): Boolean {
         val host = findTerminalHost(api, tabs) ?: return false
         val newTabId = runCatching {
