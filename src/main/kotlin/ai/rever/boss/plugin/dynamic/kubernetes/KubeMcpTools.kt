@@ -317,7 +317,9 @@ class KubeMcpToolProvider(
 
         McpToolDefinition(
             name = "k8s_apply",
-            description = "Apply a manifest or kustomization in a BOSS terminal tab. Use dry_run=true first " +
+            description = "Apply a manifest or kustomization in the plugin's shared terminal tab. " +
+                "Another terminal-routed command (apply, diff, or a helm mutation) interrupts it; " +
+                "the read tools do not, so confirming with k8s_get is safe. Use dry_run=true first " +
                 "to see what would change without changing it.",
             inputSchema = """
                 {"type":"object","properties":{
@@ -342,17 +344,19 @@ class KubeMcpToolProvider(
                 if (services.actions.apply(artifact, dryRun = dryRun)) {
                     McpToolResult(
                         "${if (dryRun) "Dry-run applying" else "Applying"} ${file.absolutePath} " +
-                            "to ${engine.target.display()} in a terminal tab.",
+                            "to ${engine.target.display()} in the plugin terminal tab — queued, so check the tab for the result.",
                     )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
 
         McpToolDefinition(
             name = "k8s_exec",
-            description = "Open an interactive shell in a pod, in a BOSS terminal tab (exec -it needs a real TTY).",
+            description = "Open an interactive shell in a pod, in its own terminal tab (exec -it needs " +
+                "a real TTY, and Ctrl-C is forwarded into the pod rather than freeing the tab, so it " +
+                "never shares the plugin's shared one).",
             inputSchema = """
                 {"type":"object","properties":{
                   "pod":{"type":"string","description":"Pod name"},
@@ -379,7 +383,7 @@ class KubeMcpToolProvider(
                 if (opened) {
                     McpToolResult("Opened a shell in $podName (${engine.target.display()}).")
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),

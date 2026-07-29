@@ -166,20 +166,30 @@ class KubePanelViewModel(private val services: KubeServices) {
         }
         askConfirm(
             title = "Install ${tool.label}?",
-            message = "Runs `$command` in the terminal tab, where you can watch it and stop it. " +
-                "Nothing else on your system is touched.",
+            message = "Runs `$command` in its own terminal tab, where you can watch it and stop " +
+                "it. Nothing else on your system is touched.",
             confirmLabel = "Install",
         ) {
-            val launched = services.actions.openTerminal(
+            services.actions.openTerminal(
                 id = "install-${tool.binary}-${System.currentTimeMillis()}",
                 title = "Install ${tool.label}",
                 command = command,
                 workingDir = services.context.projectPath,
+                // Its own tab, not the shared one. A package install must not be
+                // interrupted and typed over by the next kubectl or helm command: a
+                // half-applied `brew install` is exactly what the confirmation above
+                // promises will not happen, and brew can prompt (for sudo, among other
+                // things) — a command typed at a password prompt is a worse outcome
+                // than a lost build.
+                kind = TerminalCommandKind.Interactive,
+                // Fired on delivery, not acceptance: watchForTool polls for two minutes
+                // and openTerminal now returns as soon as the command is queued, so
+                // timing from its return starts the clock before the install runs.
+                onDelivered = {
+                    services.toastInfo("Installing ${tool.label}…")
+                    watchForTool(tool)
+                },
             )
-            if (launched) {
-                services.toastInfo("Installing ${tool.label}…")
-                watchForTool(tool)
-            }
         }
     }
 

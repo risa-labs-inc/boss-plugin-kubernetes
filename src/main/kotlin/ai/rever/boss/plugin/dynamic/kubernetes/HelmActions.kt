@@ -274,17 +274,22 @@ class HelmActions(private val services: KubeServices) {
         parts: List<String>,
         workingDir: String?,
         location: OpenLocation,
-    ): Boolean {
-        val launched = services.actions.openTerminal(
+        kind: TerminalCommandKind = TerminalCommandKind.Batch,
+    ): Boolean =
+        services.actions.openTerminal(
             id = id,
             title = title,
             command = parts.joinToString(" "),
             workingDir = workingDir,
             location = location,
+            kind = kind,
+            // Scheduled from delivery, not from acceptance. openTerminal now returns as
+            // soon as the command is queued, and delivery costs the interrupt sequence
+            // plus however long the commands ahead of it take — so timing the refresh
+            // from the return value could refresh before helm had started, leaving the
+            // sidebar on the pre-upgrade state.
+            onDelivered = { services.scheduleHelmRefresh() },
         )
-        if (launched) services.scheduleHelmRefresh()
-        return launched
-    }
 
     /** helm's target flags as shell strings, for the terminal-tab commands. */
     private fun targetFlagStrings(): List<String> {

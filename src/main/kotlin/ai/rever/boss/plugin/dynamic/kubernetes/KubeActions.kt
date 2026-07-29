@@ -1,12 +1,85 @@
 package ai.rever.boss.plugin.dynamic.kubernetes
 
+import ai.rever.boss.plugin.api.ActiveTabData
 import ai.rever.boss.plugin.api.TabSplitMode
 import ai.rever.boss.plugin.api.TerminalTabPluginAPI
 import ai.rever.boss.plugin.tab.terminal.TerminalTabInfo
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
 import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
 
 /** Where a launched terminal tab should be placed. */
 enum class OpenLocation { NEW_TAB, SPLIT_RIGHT, SPLIT_DOWN }
+
+/**
+ * How a command occupies the terminal, which decides whether it may share the tab.
+ *
+ * The distinction exists because Ctrl-C does not mean the same thing to all three, and
+ * treating them alike is unsafe rather than merely untidy.
+ */
+enum class TerminalCommandKind {
+    /**
+     * Shares the plugin's tab, and may be interrupted by the next command.
+     *
+     * That is survivable for a read, and costly for a `helm upgrade --wait` — Ctrl-C
+     * stops the client but leaves the release in `pending-upgrade`, so the next upgrade
+     * fails with "another operation in progress". The `helm_*` tools say so up front
+     * rather than the plugin discovering it afterwards.
+     */
+    Batch,
+
+    /**
+     * Holds the pty and cannot be interrupted out of. **Never shares the tab.**
+     *
+     * `kubectl exec -it` puts the local terminal in raw mode and *forwards* 0x03 to the
+     * remote process: the container's shell takes the SIGINT and prints a fresh prompt,
+     * while kubectl itself keeps running and keeps owning the pty. So the interrupt that
+     * makes reuse safe for everything else does nothing here, and the next command would
+     * be typed **into the container's shell** — in a pod that has kubectl and a mounted
+     * service-account token, that runs against the cluster with the *pod's* credentials
+     * instead of the operator's kubeconfig, and the sidebar would report success.
+     */
+    Interactive,
+}
+
+/**
+ * Identifies the terminal tab the plugin runs its commands in.
+ *
+ * File-private and held only by [KubeActions], so the encapsulation the consumer design
+ * depends on is structural: nothing outside this file can retarget the tab without
+ * going through the queue.
+ */
+private data class CommandTerminal(
+    val windowId: String,
+    /** The BOSS tab hosting the tabbed terminal. */
+    val hostTabId: String,
+    /** Our sub-tab *inside* that terminal. */
+    val subTabId: String,
+)
+
+/**
+ * A command awaiting delivery to the plugin's terminal tab.
+ *
+ * Carries [id] and [title] as well as the command so the consumer can still open a
+ * BOSS terminal tab if the terminal it was queued for has gone away — the fallback
+ * [KubeActions.openTerminal] documents is otherwise unreachable once that function has
+ * returned true.
+ *
+ * [onDelivered] runs once the command has actually been typed. Callers that follow a
+ * command with a refresh need this: `openTerminal` now returns at *acceptance*, so
+ * anything timed from its return starts counting before the command has run.
+ */
+private data class TerminalCommand(
+    val id: String,
+    val title: String,
+    val command: String,
+    val workingDir: String?,
+    val kind: TerminalCommandKind,
+    val onDelivered: (() -> Unit)?,
+)
 
 /**
  * Cluster mutations and the interactive commands.
@@ -24,6 +97,83 @@ enum class OpenLocation { NEW_TAB, SPLIT_RIGHT, SPLIT_DOWN }
 class KubeActions(private val services: KubeServices) {
 
     private val engine get() = services.engine
+
+    /**
+     * The terminal tab this plugin owns.
+     *
+     * Confined to the consumer — [runTerminalCommands] is the only reader and writer, and
+     * there is exactly one of it. `@Volatile` is belt-and-braces for a caller-side read
+     * that no longer exists.
+     *
+     * Kept here rather than on [KubeServices] so that guarantee is structural — a public
+     * field on the shared services object is one any future call site can write without
+     * going through the queue.
+     *
+     * Session-scoped and never persisted; tab ids don't survive a restart.
+     */
+    @Volatile
+    private var ownedTerminal: CommandTerminal? = null
+
+    /** Commands accepted but not yet taken by the consumer. */
+    private val pending = AtomicInteger(0)
+
+    /**
+     * Whether [start] has run.
+     *
+     * Load-bearing enough to assert: with no consumer, `trySend` succeeds forever and
+     * every command is reported launched and never delivered — the exact failure
+     * [terminalCommands] warns about. The wiring is one call away in another class, so
+     * this is checked rather than assumed.
+     */
+    @Volatile
+    private var started = false
+
+    /** The plugin has no host logger; this keeps the one prefix in one place. */
+    private fun log(message: String) = System.err.println("[Kubernetes] $message")
+
+    /**
+     * One command per send, drained in order by [runTerminalCommands].
+     *
+     * Unbounded, which is what makes a dead consumer dangerous rather than merely
+     * broken: `trySend` keeps succeeding, so [runInExistingTerminal] keeps returning
+     * true and every later command is reported as launched while nothing is ever typed.
+     * Hence the guard in the consumer loop and in [fallBackToBossTab], and [dispose]
+     * closing the channel.
+     */
+    private val terminalCommands = Channel<TerminalCommand>(Channel.UNLIMITED)
+
+    /**
+     * Start draining [terminalCommands]. Called from [KubeServices.start].
+     *
+     * Not an `init` block: this class is constructed from a `KubeServices` property
+     * initializer, so launching there would depend on `scope` happening to be declared
+     * above `actions` — reorder those two lines and the plugin fails to activate with an
+     * NPE and no obvious cause. An explicit call makes the ordering a fact rather than
+     * an accident.
+     */
+    fun start() {
+        started = true
+        services.scope.launch { runTerminalCommands() }
+    }
+
+    /**
+     * Stop accepting commands.
+     *
+     * Closing matters as much as cancelling the scope: on a closed channel `trySend`
+     * fails, so [runInExistingTerminal] returns false and a command issued during
+     * teardown falls through to the BOSS-tab path instead of being accepted by a
+     * consumer that will never run and reported as a success.
+     */
+    fun dispose() {
+        terminalCommands.close()
+        // Named rather than dropped in silence. Anything still queued was already
+        // reported as launched, so a note is the difference between a debuggable
+        // teardown and a mystery.
+        val dropped = generateSequence { terminalCommands.tryReceive().getOrNull() }.toList()
+        if (dropped.isNotEmpty()) {
+            log("Dropped ${dropped.size} queued command(s) on dispose: " + dropped.joinToString("; ") { it.command })
+        }
+    }
 
     /** `context / namespace`, for confirmation dialogs and tool output. */
     fun describeTarget(): String = engine.target.value.display
@@ -82,6 +232,10 @@ class KubeActions(private val services: KubeServices) {
             command = command,
             workingDir = services.context.projectPath,
             location = location,
+            // Never shares the plugin's tab: Ctrl-C is forwarded into the pod, so the
+            // session keeps the pty and a later command would be typed at the
+            // container's shell. See [TerminalCommandKind.Interactive].
+            kind = TerminalCommandKind.Interactive,
         )
     }
 
@@ -93,8 +247,14 @@ class KubeActions(private val services: KubeServices) {
      * top-level tab clutters the tab bar fast, and BossTerm already has its own tab
      * strip built for exactly this.
      *
-     * Falls back to a new BOSS terminal tab when there is no live terminal to join
-     * (or [forceNewTab] is set, or the terminal-tab plugin isn't loaded).
+     * Falls back to a new BOSS terminal tab when there is no live terminal to join at
+     * all, or when the terminal-tab plugin isn't loaded. A terminal in this window is
+     * preferred but not required — see [findTerminalHost].
+     *
+     * **Every `NEW_TAB` caller shares one tab and interrupts the others** unless its kind
+     * is [TerminalCommandKind.Interactive]. The `k8s_*` and `helm_*` tool text enumerates
+     * which commands those are; nothing checks that enumeration, so adding a caller means
+     * updating it too.
      */
     fun openTerminal(
         id: String,
@@ -102,9 +262,12 @@ class KubeActions(private val services: KubeServices) {
         command: String,
         workingDir: String?,
         location: OpenLocation = OpenLocation.NEW_TAB,
-        forceNewTab: Boolean = false,
+        kind: TerminalCommandKind = TerminalCommandKind.Batch,
+        onDelivered: (() -> Unit)? = null,
     ): Boolean {
-        if (!forceNewTab && location == OpenLocation.NEW_TAB && runInExistingTerminal(command, workingDir)) {
+        if (location == OpenLocation.NEW_TAB &&
+            runInExistingTerminal(id, title, command, workingDir, kind, onDelivered)
+        ) {
             return true
         }
 
@@ -123,78 +286,408 @@ class KubeActions(private val services: KubeServices) {
             OpenLocation.SPLIT_RIGHT -> ops.openTabInSplit(tabInfo, TabSplitMode.VERTICAL_SPLIT)
             OpenLocation.SPLIT_DOWN -> ops.openTabInSplit(tabInfo, TabSplitMode.HORIZONTAL_SPLIT)
         }
+        runCatching { onDelivered?.invoke() }
         return true
     }
 
     /**
-     * Run [command] in the single terminal tab this plugin owns, creating that tab
-     * only the first time.
+     * Queue [command] for the terminal tab this plugin owns.
      *
-     * Two things this must not do: create a tab per command (the tab strip fills up
-     * within minutes of normal use), and type into a tab the plugin doesn't own —
-     * `sendCommand` goes to the terminal's *active* tab, so blindly sending would
-     * inject a `helm upgrade` into whatever the user happens to be running.
+     * Two things this must not do. Create a tab per command — that is the bug being
+     * fixed (the tab strip fills up within minutes of ordinary use). And type into a
+     * tab the plugin doesn't own: `sendCommand` writes to the terminal's *active* tab,
+     * so reusing "whatever is focused" would inject a `helm upgrade` into whatever the
+     * user happens to be running there.
      *
-     * @return true if the command was delivered to a terminal.
+     * Nothing is inspected here, deliberately. Deciding whether a terminal exists meant
+     * a `getPluginAPI` plus a `hasTerminalState` registry lookup **per open tab**, on
+     * the caller's thread — which for a panel click is the UI thread, and scales with
+     * tab count. The consumer already re-checks all of it and already handles "no
+     * terminal to join" by opening a BOSS tab, so the work was duplicated as well as
+     * misplaced. The only thing given up is a synchronous false, and on this path the
+     * return was already advisory: it means "accepted for delivery", not "running".
+     *
+     * `trySend` fails only on a closed channel, i.e. after [dispose], which is the one
+     * case where the caller should fall through to opening a tab itself.
      */
-    private fun runInExistingTerminal(command: String, workingDir: String?): Boolean {
-        // Resolved per call: cross-plugin APIs can appear after our register().
-        val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java) ?: return false
-        val tabs = services.context.activeTabsProvider?.activeTabs?.value ?: return false
+    private fun runInExistingTerminal(
+        id: String,
+        title: String,
+        command: String,
+        workingDir: String?,
+        kind: TerminalCommandKind,
+        onDelivered: (() -> Unit)?,
+    ): Boolean {
+        check(started) { "KubeActions.start() was never called; commands would queue and never be delivered" }
+        // Never leave the directory implicit. On reuse the tab sits wherever the last
+        // command left it, so a null workingDir would run this one in some other
+        // project's directory — which for `helm install ./chart` and
+        // `kubectl apply -f ./manifest.yaml` means applying the wrong file, not just
+        // running in the wrong place.
+        val dir = workingDir?.takeIf { it.isNotBlank() }
+            ?: services.context.projectPath?.takeIf { it.isNotBlank() }
+        // Counted *before* the send, not after: the consumer can receive, decrement and
+        // read `pending` in the window between a post-send increment and its own read, so
+        // the count would go transiently negative and the contention check would see 0
+        // while an item really was queued.
+        pending.incrementAndGet()
+        val accepted = terminalCommands
+            .trySend(TerminalCommand(id, title, command, dir, kind, onDelivered))
+            .isSuccess
+        if (!accepted) pending.decrementAndGet()
+        return accepted
+    }
 
-        // Reuse our own tab when it's still there.
-        services.commandTerminal?.let { owned ->
-            val stillHosted = tabs.any { it.tabId == owned.terminalId && it.windowId == owned.windowId }
-            val stillOpen = stillHosted && runCatching {
-                api.listTabs(owned.windowId, owned.terminalId).any { it.id == owned.tabId }
-            }.getOrDefault(false)
-            if (stillOpen) {
-                // Switch first: sendCommand targets the active tab, so this is what
-                // guarantees the command lands in ours.
-                val switched = runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }
-                    .getOrDefault(false)
-                if (switched) {
-                    val full = if (workingDir.isNullOrBlank()) command else "cd ${q(workingDir)} && $command"
-                    val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }
-                        .getOrDefault(false)
-                    if (sent) {
-                        focusHostTab(tabs, owned.terminalId)
-                        return true
-                    }
+    /**
+     * The single consumer of [terminalCommands].
+     *
+     * One consumer is the whole design. Delivering a command is
+     * switch → interrupt → wait → type, and the wait is unavoidable: `sendCommand`
+     * writes to the tab's pty, so while a foreground process is running the text goes
+     * to *that process's stdin* — never queued, never run — and Ctrl-C is what makes
+     * the shell the reader again. Nothing may interleave with that sequence. An earlier
+     * attempt held a `synchronized` block across the interrupt but `launch`ed the send,
+     * which let a second command's interrupt land *before* the first command had been
+     * typed, so the first ran and the second was swallowed — the exact bug the
+     * interrupt exists to prevent, reintroduced one step later. Sequencing it through
+     * a channel makes the ordering structural rather than something the comments claim.
+     *
+     * Running here also keeps all of it off the UI thread: panel clicks call
+     * [openTerminal] directly, and this body makes cross-plugin calls whose threading
+     * contract the plugin does not control.
+     */
+    private suspend fun runTerminalCommands() {
+        for (queued in terminalCommands) {
+            // One bad command must not cost the feature: a consumer that dies takes
+            // every later command with it, silently (see [terminalCommands]). Both
+            // `getPluginAPI` can fail at linkage and the fallback's toast is a
+            // cross-plugin call, so the guard catches Throwable rather than Exception.
+            pending.decrementAndGet()
+            try {
+                deliver(queued)
+            } catch (cancel: CancellationException) {
+                // Named for the same reason dispose() names what it drops: this command
+                // was already reported as launched, and it is the one most likely to
+                // matter, because it was mid-delivery rather than still queued.
+                log("Cancelled mid-delivery: ${queued.command}")
+                throw cancel // plugin is being disposed; not a delivery failure
+            } catch (t: Throwable) {
+                log("Terminal delivery failed: $t")
+                fallBackToBossTab(queued)
+            }
+        }
+    }
+
+    /** Deliver one queued command, reusing our tab or creating it. */
+    private suspend fun deliver(queued: TerminalCommand) {
+        val api = services.context.getPluginAPI(TerminalTabPluginAPI::class.java)
+        val tabs = services.context.activeTabsProvider?.activeTabs?.value
+        if (api == null || tabs == null) {
+            // Said out loud rather than swallowed: this degrades to a BOSS tab per
+            // command — the clutter this path exists to remove — so the reason needs to
+            // be findable. Both causes are real: terminal-tab not loaded, or a host that
+            // supplies no activeTabsProvider. The message names which.
+            val missing = if (api == null) "terminal-tab API" else "activeTabsProvider"
+            log("No $missing; opening a BOSS tab for: ${queued.command}")
+            fallBackToBossTab(queued)
+            return
+        }
+        val full = if (queued.workingDir == null) queued.command else "cd ${q(queued.workingDir)} && ${queued.command}"
+        var hadOwnTab = false
+        val delivered = when {
+            // An interactive session gets its own pty and is never recorded as the owned
+            // one: it cannot be interrupted out of, so sharing would strand every later
+            // command inside it. See [TerminalCommandKind.Interactive]. A bottom split of
+            // the tab we already own when there is one, so it lands beside the plugin's
+            // output rather than in a tab of its own.
+            queued.kind == TerminalCommandKind.Interactive ->
+                createSideTab(api, tabs, full)
+
+            // Something is already queued behind this one, so delivering it to the shared
+            // tab would type it and then interrupt it ~0 ms later: killed before it did
+            // anything, with its caller already told it was accepted.
+            //
+            // Note what this does *not* claim: `pending` is read once, at the start of this
+            // delivery, so it only catches a command enqueued before that read. Two clicks
+            // a second apart still interrupt-supersede, because the second arrives while
+            // the first is mid-delivery. Interrupt-supersedes is the common case; this is
+            // the narrow one where the collision is visible in advance. Skipping instead is
+            // not an option: a silently dropped `helm uninstall` is worse than a noisy one.
+            pending.get() > 0 -> {
+                log("Another command is queued; giving this one its own tab rather than superseding it")
+                createSideTab(api, tabs, full)
+            }
+
+            else -> {
+                val owned = liveOwnedTerminal(api, tabs)
+                hadOwnTab = owned != null
+                if (owned != null) {
+                    deliverToOwnedTab(api, owned, full)
+                } else {
+                    // `full`, not the bare command: both paths then derive the directory
+                    // the same way. Relying on createTab's workingDirectory here instead
+                    // would mean that if it is ever not honoured for the initial command,
+                    // the *first* command runs in the wrong place and every later one is
+                    // right — miserable to debug, and for `kubectl apply -f ./x.yaml` it
+                    // is the wrong file, not just the wrong directory.
+                    createOwnedTab(api, tabs, full)
                 }
             }
-            // Gone or unusable — forget it and make a fresh one below.
-            services.commandTerminal = null
         }
+        if (delivered) {
+            runCatching { queued.onDelivered?.invoke() }
+        } else {
+            // Two different failures, and conflating them is what you would be
+            // debugging from: no tabbed terminal open anywhere, versus our own tab
+            // refusing a write.
+            if (hadOwnTab) {
+                // Forget it. `liveOwnedTerminal` only drops a tab that is *gone*, so one
+                // that exists but refuses writes would stay owned forever: every later
+                // command paying two Ctrl-Cs and 1.2 s, stopping whatever is in it, and
+                // opening a BOSS tab anyway — on a loop, in silence.
+                log("Our terminal tab refused the command; dropping it")
+                ownedTerminal = null
+            } else {
+                log("No tabbed terminal to join; opening a BOSS tab")
+            }
+            fallBackToBossTab(queued)
+        }
+    }
 
-        // Probe every tab rather than filtering on a typeId string: hasTerminalState
-        // is a registry lookup and the authoritative answer to "is this a tabbed
-        // terminal?", so it can't drift if the type id is renamed. Prefer this
-        // window's terminals over another window's.
-        val myWindow = services.context.windowId
-        val candidate = tabs.asSequence()
-            .sortedByDescending { it.windowId == myWindow }
-            .firstOrNull { runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false) }
-            ?: return false
+    /**
+     * Open a BOSS terminal tab for a command we couldn't hand to the owned one.
+     *
+     * This is the fallback [openTerminal]'s KDoc promises, reached late. By the time a
+     * command drains, the terminal that existed when it was accepted may be gone — and
+     * without this the only remaining option was telling the operator to run it by hand,
+     * which is a worse outcome than the pre-reuse behaviour.
+     */
+    private fun fallBackToBossTab(queued: TerminalCommand) {
+        // Guarded as a whole, including the toasts: this runs inside the consumer's catch
+        // block, so anything escaping here kills the consumer (see [terminalCommands]).
+        // `toastError` reaches the host's notification provider, so it is not exempt.
+        val opened = runCatching {
+            val ops = services.context.splitViewOperations
+            if (ops == null) {
+                services.toastError("No terminal available — run manually: ${queued.command}")
+                return@runCatching false
+            }
+            ops.openTab(
+                TerminalTabInfo(
+                    id = queued.id,
+                    title = queued.title,
+                    initialCommand = queued.command,
+                    workingDirectory = queued.workingDir,
+                ),
+            )
+            true
+        }.onFailure { failure ->
+            log("Terminal fallback failed: $failure")
+            runCatching {
+                services.toastError("Couldn't reach the terminal — run manually: ${queued.command}")
+            }
+        }.getOrDefault(false)
 
+        // Outside the block above, and isolated on its own. The command *does* run here,
+        // just in its own BOSS tab — so a throwing callback must not be mistaken for the
+        // open having failed. `installTool`'s callback fires a toast, and conflating the
+        // two would tell the user to run by hand a `brew install` that is already running
+        // *and* leave `watchForTool` unstarted, so the panel stays stuck in its
+        // not-installed state.
+        if (opened) runCatching { queued.onDelivered?.invoke() }
+    }
+
+    /** Our tab, if it is still open; forgets it and returns null otherwise. */
+    private fun liveOwnedTerminal(api: TerminalTabPluginAPI, tabs: List<ActiveTabData>): CommandTerminal? {
+        val owned = ownedTerminal ?: return null
+        val stillHosted = tabs.any { it.tabId == owned.hostTabId && it.windowId == owned.windowId }
+        val stillOpen = stillHosted && runCatching {
+            api.listTabs(owned.windowId, owned.hostTabId).any { it.id == owned.subTabId }
+        }.onFailure {
+            // Logged for the same reason the refusal path is: a listTabs that keeps
+            // throwing drops ownership every time, so every command creates a fresh
+            // sub-tab — the clutter this exists to remove, arriving silently.
+            log("listTabs failed; treating the owned tab as gone: $it")
+        }.getOrDefault(false)
+        if (stillOpen) return owned
+        ownedTerminal = null
+        return null
+    }
+
+    /**
+     * Type [full] into the tab we own, interrupting whatever is running there first.
+     *
+     * Reusing one tab makes these commands mutually exclusive, which is a real cost:
+     * stopping a `helm upgrade --wait` does not just lose output, it leaves the release
+     * in `pending-upgrade`. That is said prospectively by the `helm_*` tools, at the
+     * moment a caller can still act on it, rather than by a toast after the fact — there
+     * is no liveness signal to gate one on, so it fired on every command and became
+     * noise (boss-plugins#11).
+     *
+     * **The wait before typing is a heuristic, and the known weak point here.**
+     * `sendCommand` writes to the pty, so the shell has to be the one reading by the
+     * time it lands; the API exposes no prompt or liveness signal to wait *for*, only a
+     * sleep. What holds this plugin's pty is `helm install/upgrade --wait` and `kubectl
+     * apply` against a slow cluster, neither of which dies instantly on SIGINT, so the
+     * interrupt is sent twice with the wait split around it — clients generally escalate
+     * on a second SIGINT, and a second Ctrl-C costs an idle shell nothing but a fresh
+     * prompt line. Retrying the *command* instead would risk running it twice, which for
+     * a `helm upgrade` is worse than losing it. A liveness query on the terminal API is
+     * the real fix (boss-plugins#11).
+     *
+     * `kubectl exec -it` is **not** in that list, and cannot be: it forwards the
+     * interrupt into the pod rather than dying. Those never reach this function — see
+     * [TerminalCommandKind.Interactive].
+     *
+     * `sendInterrupt` and `sendCommand` take no `tabId` — they act on the terminal's
+     * *active* tab — so [focusOurTab] is the only thing keeping them off another tab,
+     * which here may be an `exec -it` session. It is re-asserted before each write
+     * rather than once up front, because the last write lands 1.2 s after the first
+     * check and the active tab can change in between. No atomic switch-and-write
+     * exists, so this shrinks the window rather than closing it; it is free on the
+     * happy path because `switchToTabById` returns true when the tab is already active.
+     *
+     * Verified against BossTerm compose-ui `TabController` (bossterm-compose 1.2.129):
+     * the switch is safe from this background thread because the target is resolved by
+     * *reading state* — `activeTabIndex` is `by mutableStateOf` and `activeTab` is a
+     * plain getter over it — not by waiting for recomposition.
+     *
+     * @return true if the command was typed.
+     */
+    private suspend fun deliverToOwnedTab(
+        api: TerminalTabPluginAPI,
+        owned: CommandTerminal,
+        full: String,
+    ): Boolean {
+        // Switch first, and this is what makes the interrupt safe: sendInterrupt and
+        // sendCommand take no tabId, so both act on the terminal's *active* tab, and
+        // without the switch a Ctrl-C could land on the user's own tab.
+        //
+        // Re-asserted before *every* write. See the KDoc: the switch is the only thing
+        // keeping these off another tab, and it is verified 1.2 s before the last of
+        // them lands.
+        suspend fun focusOurTab(): Boolean =
+            runCatching { api.switchToTab(owned.windowId, owned.hostTabId, owned.subTabId) }
+                .getOrDefault(false)
+
+        if (!focusOurTab()) return false
+        runCatching { api.sendInterrupt(owned.windowId, owned.hostTabId) }
+        delay(INTERRUPT_ESCALATE_MS)
+        if (!focusOurTab()) return false
+        runCatching { api.sendInterrupt(owned.windowId, owned.hostTabId) }
+        delay(SHELL_REGAIN_LINE_MS)
+        if (!focusOurTab()) return false
+
+        val sent = runCatching { api.sendCommand(owned.windowId, owned.hostTabId, full) }.getOrDefault(false)
+        if (sent) {
+            // Deliberately not phrased as "interrupting the previous command": nothing
+            // tells us whether one was still running, and a toast that cries wolf every
+            // time is the one that gets tuned out on the occasion it matters.
+            // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
+            // focusing a tab that has since moved is benign but wrong, and this is free.
+            focusHostTab(owned.hostTabId, owned.windowId)
+        }
+        return sent
+    }
+
+    /**
+     * A tab of its own for a command that must not share one, left unowned.
+     *
+     * A sibling terminal tab rather than a bottom split of the owned one, which would be
+     * tidier: `createTab` takes an `initialCommand` that BossTerm holds until OSC 133;A
+     * (or a fallback delay) "so the shell is ready before bytes go down the PTY", whereas
+     * the plugin API's `splitHorizontal` exposes no such parameter. Delivering into a
+     * split therefore means writing to a pane whose shell may not have spawned — the
+     * write succeeds, the command vanishes, and nothing falls back. Same silent-loss
+     * shape as the reverted batching experiment. See boss-plugins#13.
+     *
+     * Interactive sessions are inherently one per session, so a tab each is the right
+     * shape rather than a regression toward tab-per-command — and it stays inside the
+     * same BOSS tab, which is what the reuse was for.
+     *
+     * Still goes through the queue rather than bypassing it, even though it makes its own
+     * tab. That is deliberate: this calls `switchToTab` and `focusHostTab`, so running it
+     * concurrently would let it steal the active tab inside [deliverToOwnedTab]'s
+     * switch→write window — exactly what those re-assertions guard against. The cost is
+     * that a "Shell" click waits behind any queued Batch command.
+     */
+    private fun createSideTab(
+        api: TerminalTabPluginAPI,
+        tabs: List<ActiveTabData>,
+        command: String,
+    ): Boolean {
+        val host = findTerminalHost(api, tabs) ?: return false
+        val tabId = runCatching {
+            api.createTab(
+                windowId = host.windowId,
+                terminalId = host.tabId,
+                // Same as createOwnedTab: `command` carries its own cd rather than
+                // trusting createTab's workingDirectory, so both paths agree. Today the
+                // only Interactive command is `exec -it`, where cwd never reaches the
+                // pod and this is moot — but the next one inherits whichever choice is
+                // made here, so it may as well inherit the safe one.
+                initialCommand = command,
+            )
+        }.getOrNull() ?: return false
+        runCatching { api.switchToTab(host.windowId, host.tabId, tabId) }
+        focusHostTab(host.tabId, host.windowId)
+        return true
+    }
+
+    /** Create the tab we will own from now on, running [command] as it starts. */
+    private fun createOwnedTab(
+        api: TerminalTabPluginAPI,
+        tabs: List<ActiveTabData>,
+        command: String,
+    ): Boolean {
+        val host = findTerminalHost(api, tabs) ?: return false
         val newTabId = runCatching {
             api.createTab(
-                windowId = candidate.windowId,
-                terminalId = candidate.tabId,
-                workingDirectory = workingDir,
+                windowId = host.windowId,
+                terminalId = host.tabId,
+                // No workingDirectory: `command` carries its own cd, so this path and the
+                // reuse path agree on where a command runs.
                 initialCommand = command,
             )
         }.getOrNull() ?: return false
 
-        services.commandTerminal = CommandTerminal(candidate.windowId, candidate.tabId, newTabId)
-        runCatching { api.switchToTab(candidate.windowId, candidate.tabId, newTabId) }
-        focusHostTab(tabs, candidate.tabId)
+        ownedTerminal = CommandTerminal(windowId = host.windowId, hostTabId = host.tabId, subTabId = newTabId)
+        runCatching { api.switchToTab(host.windowId, host.tabId, newTabId) }
+        focusHostTab(host.tabId, host.windowId)
         return true
     }
 
-    /** Bring the BOSS tab hosting the terminal forward so the output is visible. */
-    private fun focusHostTab(tabs: List<ai.rever.boss.plugin.api.ActiveTabData>, terminalId: String) {
-        val host = tabs.firstOrNull { it.tabId == terminalId } ?: return
+    /**
+     * A tabbed terminal in *this* window to host our tab, or null.
+     *
+     * Probes every tab rather than filtering on a typeId string: `hasTerminalState` is a
+     * registry lookup and the authoritative answer to "is this a tabbed terminal?", so
+     * it can't drift if the type id is renamed.
+     *
+     * Confined to this window on purpose. Searching every window meant a click in
+     * window A could create the tab in window B and pull focus there; falling back to a
+     * new BOSS tab in the window the operator is actually looking at is the less
+     * surprising outcome.
+     */
+    private fun findTerminalHost(api: TerminalTabPluginAPI, tabs: List<ActiveTabData>): ActiveTabData? {
+        val myWindow = services.context.windowId
+        val hosts = tabs.filter {
+            runCatching { api.hasTerminalState(it.windowId, it.tabId) }.getOrDefault(false)
+        }
+        return hosts.firstOrNull { it.windowId == myWindow }
+            ?: hosts.firstOrNull()?.also {
+                log("No terminal in window $myWindow; using one in ${it.windowId}")
+            }
+    }
+
+    /**
+     * Bring the BOSS tab hosting the terminal forward so the output is visible.
+     *
+     * Matched on window as well as tab: a tab id alone can name another window's tab.
+     */
+    private fun focusHostTab(terminalId: String, windowId: String) {
+        val tabs = services.context.activeTabsProvider?.activeTabs?.value ?: return
+        val host = tabs.firstOrNull { it.tabId == terminalId && it.windowId == windowId } ?: return
         runCatching { services.context.activeTabsProvider?.selectTab(host.tabId, host.panelId) }
     }
 
@@ -235,6 +728,21 @@ class KubeActions(private val services: KubeServices) {
         KubectlCli.exec(engine.args(command), timeoutMs = timeoutMs).also { engine.requestRefresh() }
 
     companion object {
+        /**
+         * How long to let the shell regain the line after the last Ctrl-C before typing.
+         * terminal-tab's own re-run delay defaults to 500 ms, but that is for an *idle*
+         * tab; here a live process may still be tearing down, so the total wait is
+         * longer and split around a second interrupt.
+         */
+        private const val SHELL_REGAIN_LINE_MS = 800L
+
+        /** Gap before the second Ctrl-C, which is what forces a stubborn client to quit. */
+        private const val INTERRUPT_ESCALATE_MS = 400L
+
+        // TODO(boss-plugins#11): both delays are unconditional, so five queued commands
+        // sleep ~6 s and leave ten stray prompt lines. A liveness query on
+        // TerminalTabPluginAPI would let an idle tab skip the interrupt entirely.
+
         fun isSecretKind(kind: String): Boolean =
             kind.lowercase().trimEnd('s') == "secret"
 
