@@ -54,8 +54,10 @@ enum class TerminalCommandKind {
  */
 private data class CommandTerminal(
     val windowId: String,
-    val terminalId: String,
-    val tabId: String,
+    /** The BOSS tab hosting the tabbed terminal. */
+    val hostTabId: String,
+    /** Our sub-tab *inside* that terminal. */
+    val subTabId: String,
 )
 
 /**
@@ -99,11 +101,9 @@ class KubeActions(private val services: KubeServices) {
     /**
      * The terminal tab this plugin owns.
      *
-     * Confined to the consumer: [runTerminalCommands] is the only reader and writer, and
-     * there is exactly one of it, so no atomicity or visibility is needed today. (The
-     * accept path used to read it too; that went away when it stopped inspecting
-     * anything.) `@Volatile` is kept as belt-and-braces in case a caller-side read is
-     * ever reintroduced — not because one exists.
+     * Confined to the consumer — [runTerminalCommands] is the only reader and writer, and
+     * there is exactly one of it. `@Volatile` is belt-and-braces for a caller-side read
+     * that no longer exists.
      *
      * Kept here rather than on [KubeServices] so that guarantee is structural — a public
      * field on the shared services object is one any future call site can write without
@@ -458,9 +458,14 @@ class KubeActions(private val services: KubeServices) {
     /** Our tab, if it is still open; forgets it and returns null otherwise. */
     private fun liveOwnedTerminal(api: TerminalTabPluginAPI, tabs: List<ActiveTabData>): CommandTerminal? {
         val owned = ownedTerminal ?: return null
-        val stillHosted = tabs.any { it.tabId == owned.terminalId && it.windowId == owned.windowId }
+        val stillHosted = tabs.any { it.tabId == owned.hostTabId && it.windowId == owned.windowId }
         val stillOpen = stillHosted && runCatching {
-            api.listTabs(owned.windowId, owned.terminalId).any { it.id == owned.tabId }
+            api.listTabs(owned.windowId, owned.hostTabId).any { it.id == owned.subTabId }
+        }.onFailure {
+            // Logged for the same reason the refusal path is: a listTabs that keeps
+            // throwing drops ownership every time, so every command creates a fresh
+            // sub-tab — the clutter this exists to remove, arriving silently.
+            log("listTabs failed; treating the owned tab as gone: $it")
         }.getOrDefault(false)
         if (stillOpen) return owned
         ownedTerminal = null
@@ -492,6 +497,19 @@ class KubeActions(private val services: KubeServices) {
      * interrupt into the pod rather than dying. Those never reach this function — see
      * [TerminalCommandKind.Interactive].
      *
+     * `sendInterrupt` and `sendCommand` take no `tabId` — they act on the terminal's
+     * *active* tab — so [focusOurTab] is the only thing keeping them off another tab,
+     * which here may be an `exec -it` session. It is re-asserted before each write
+     * rather than once up front, because the last write lands 1.2 s after the first
+     * check and the active tab can change in between. No atomic switch-and-write
+     * exists, so this shrinks the window rather than closing it; it is free on the
+     * happy path because `switchToTabById` returns true when the tab is already active.
+     *
+     * Verified against BossTerm compose-ui `TabController` (bossterm-compose 1.2.129):
+     * the switch is safe from this background thread because the target is resolved by
+     * *reading state* — `activeTabIndex` is `by mutableStateOf` and `activeTab` is a
+     * plain getter over it — not by waiting for recomposition.
+     *
      * @return true if the command was typed.
      */
     private suspend fun deliverToOwnedTab(
@@ -504,40 +522,18 @@ class KubeActions(private val services: KubeServices) {
         // sendCommand take no tabId, so both act on the terminal's *active* tab, and
         // without the switch a Ctrl-C could land on the user's own tab.
         //
-        // Re-asserted before *every* write, not once up front.
-        //
-        // sendInterrupt and sendCommand take no tabId — they hit the terminal's *active*
-        // tab — so the switch is what keeps them off another tab. Asserting it once and
-        // then sleeping 1.2 s would mean acting on a state verified before the sleep, and
-        // the active tab can change inside that window: the user clicking a sub-tab, made
-        // *more* likely because the plugin has just pulled focus to the terminal
-        // mid-work. Here that is worse than a stray build — the neighbouring tab may be
-        // an `exec -it` session, so the command would be typed at a container's shell.
-        //
-        // There is no atomic switch-and-write in the API, so the window cannot be closed;
-        // this shrinks it from 1.2 s to the gap between two adjacent calls, and is free on
-        // the happy path because switchToTabById returns true when the tab is already
-        // active and false only when the id is unknown — the correct bail-out.
-        //
-        // Two things verified against BossTerm rather than assumed (compose-ui
-        // TabController, as of bossterm-compose 1.2.129):
-        //
-        // Safe from this background thread because BossTerm resolves the target by
-        // *reading state*, not by waiting for recomposition: `activeTabIndex` is
-        // `by mutableStateOf`, so a write from any thread lands in the global snapshot at
-        // once, and `activeTab` is a plain getter over it.
-        //
-        // And `false` really does mean "no such tab": the already-active no-op early
-        // return lives in the index-based overload switchToTabById delegates to.
+        // Re-asserted before *every* write. See the KDoc: the switch is the only thing
+        // keeping these off another tab, and it is verified 1.2 s before the last of
+        // them lands.
         suspend fun focusOurTab(): Boolean =
-            runCatching { api.switchToTab(owned.windowId, owned.terminalId, owned.tabId) }
+            runCatching { api.switchToTab(owned.windowId, owned.hostTabId, owned.subTabId) }
                 .getOrDefault(false)
 
         if (!focusOurTab()) return false
-        runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
+        runCatching { api.sendInterrupt(owned.windowId, owned.hostTabId) }
         delay(INTERRUPT_ESCALATE_MS)
         if (!focusOurTab()) return false
-        runCatching { api.sendInterrupt(owned.windowId, owned.terminalId) }
+        runCatching { api.sendInterrupt(owned.windowId, owned.hostTabId) }
         delay(SHELL_REGAIN_LINE_MS)
         if (!focusOurTab()) return false
 
@@ -553,14 +549,14 @@ class KubeActions(private val services: KubeServices) {
         if (pending.get() > 0) {
             log("Another command is already queued; this one will be interrupted almost immediately")
         }
-        val sent = runCatching { api.sendCommand(owned.windowId, owned.terminalId, full) }.getOrDefault(false)
+        val sent = runCatching { api.sendCommand(owned.windowId, owned.hostTabId, full) }.getOrDefault(false)
         if (sent) {
             // Deliberately not phrased as "interrupting the previous command": nothing
             // tells us whether one was still running, and a toast that cries wolf every
             // time is the one that gets tuned out on the occasion it matters.
             // Re-read rather than reusing the snapshot taken before ~1.2 s of delay:
             // focusing a tab that has since moved is benign but wrong, and this is free.
-            focusHostTab(owned.terminalId, owned.windowId)
+            focusHostTab(owned.hostTabId, owned.windowId)
         }
         return sent
     }
@@ -613,7 +609,7 @@ class KubeActions(private val services: KubeServices) {
             )
         }.getOrNull() ?: return false
 
-        ownedTerminal = CommandTerminal(host.windowId, host.tabId, newTabId)
+        ownedTerminal = CommandTerminal(windowId = host.windowId, hostTabId = host.tabId, subTabId = newTabId)
         runCatching { api.switchToTab(host.windowId, host.tabId, newTabId) }
         focusHostTab(host.tabId, host.windowId)
         return true
@@ -700,6 +696,10 @@ class KubeActions(private val services: KubeServices) {
 
         /** Gap before the second Ctrl-C, which is what forces a stubborn client to quit. */
         private const val INTERRUPT_ESCALATE_MS = 400L
+
+        // TODO(boss-plugins#11): both delays are unconditional, so five queued commands
+        // sleep ~6 s and leave ten stray prompt lines. A liveness query on
+        // TerminalTabPluginAPI would let an idle tab skip the interrupt entirely.
 
         fun isSecretKind(kind: String): Boolean =
             kind.lowercase().trimEnd('s') == "secret"

@@ -255,7 +255,13 @@ class HelmMcpToolProvider(
                 if (actions.packageChart(chart, dest)) {
                     McpToolResult("Packaging ${chart.name} into $dest in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    // Cause-agnostic on purpose. Not the "no terminal" path (the consumer
+                    // handles that by opening a BOSS tab) and not a post-dispose path
+                    // either, since openTerminal falls through to splitViewOperations and
+                    // returns true there. What reaches here is a host with no
+                    // splitViewOperations — naming a cause would be specific and usually
+                    // wrong.
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -271,7 +277,7 @@ class HelmMcpToolProvider(
                 if (actions.dependencyUpdate(chart)) {
                     McpToolResult("Updating dependencies for ${chart.name} in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -299,7 +305,7 @@ class HelmMcpToolProvider(
                             "tab for the result. This affects the whole machine.",
                     )
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -313,7 +319,7 @@ class HelmMcpToolProvider(
                 if (actions.repoUpdate()) {
                     McpToolResult("Updating chart repositories in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -381,7 +387,7 @@ class HelmMcpToolProvider(
                             "a --wait leaves the release pending — confirm with helm_releases.",
                     )
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -425,7 +431,7 @@ class HelmMcpToolProvider(
                             "release pending — confirm with helm_releases.",
                     )
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -452,7 +458,7 @@ class HelmMcpToolProvider(
                 if (actions.rollback(release, revision)) {
                     McpToolResult("Rolling $name back to revision $revision in ${target()}.")
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -480,7 +486,7 @@ class HelmMcpToolProvider(
                             "another command interrupts it — confirm with helm_releases.",
                     )
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -500,7 +506,7 @@ class HelmMcpToolProvider(
                 if (actions.test(release)) {
                     McpToolResult("Running tests for $name in ${target()} in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -535,7 +541,7 @@ class HelmMcpToolProvider(
                         "Pushing ${file.name} to $dest${if (plainHttp) " over plain HTTP" else ""} in the plugin terminal tab — queued, so check the tab for the result.",
                     )
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),

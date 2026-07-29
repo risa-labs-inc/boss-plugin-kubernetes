@@ -347,7 +347,7 @@ class KubeMcpToolProvider(
                             "to ${engine.target.display()} in the plugin terminal tab — queued, so check the tab for the result.",
                     )
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -383,7 +383,7 @@ class KubeMcpToolProvider(
                 if (opened) {
                     McpToolResult("Opened a shell in $podName (${engine.target.display()}).")
                 } else {
-                    McpToolResult("Couldn't queue the command — the plugin is shutting down.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
