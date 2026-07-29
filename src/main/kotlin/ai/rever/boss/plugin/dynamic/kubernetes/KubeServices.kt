@@ -26,20 +26,6 @@ class KubeServices(val context: PluginContext) {
     val helm = HelmEngine(scope, engine)
     val helmActions = HelmActions(this)
 
-    /**
-     * The one terminal tab this plugin owns for running commands, as
-     * (windowId, terminalId, tabId).
-     *
-     * All kubectl/helm commands reuse this single tab instead of creating one per
-     * command. It is deliberately *our* tab rather than whatever happens to be
-     * focused: `sendCommand` types into the terminal's active tab, so without an
-     * owned tab a command could be typed into the user's own shell session.
-     *
-     * Session-scoped and never persisted — tab ids don't survive a restart.
-     */
-    @Volatile
-    var commandTerminal: CommandTerminal? = null
-
     private val storage: PluginStorageProvider? by lazy {
         runCatching { context.pluginStorageFactory?.createStorage(PLUGIN_ID) }.getOrNull()
     }
@@ -61,6 +47,7 @@ class KubeServices(val context: PluginContext) {
     fun start() {
         engine.start()
         helm.start()
+        actions.start()
         scope.launch {
             // Restore the selection and pinned CRDs before the first render, so the
             // panel doesn't flash the wrong namespace.
@@ -80,7 +67,13 @@ class KubeServices(val context: PluginContext) {
         forwards.dispose()
         helm.dispose()
         engine.dispose()
+        // Before actions.dispose(): that drains the queue to report what was lost, and
+        // with the consumer still alive the two race. This *narrows* the race rather than
+        // closing it — cancellation is cooperative, so a consumer already inside a
+        // non-suspending sendCommand keeps going. (And per the known host gap, dispose()
+        // is not called on plugin *disable* at all, so this path is best-effort anyway.)
         scope.cancel()
+        actions.dispose()
     }
 
     /** Open (or focus) the Helm release tab for [release]. */
@@ -212,13 +205,6 @@ class KubeServices(val context: PluginContext) {
         private const val HELM_SETTLE_MS = 2_500L
     }
 }
-
-/** Identifies the terminal tab the plugin runs its commands in. */
-data class CommandTerminal(
-    val windowId: String,
-    val terminalId: String,
-    val tabId: String,
-)
 
 /** What [KubeServices.openResourceTabVerified] observed. */
 enum class TabOpenOutcome {

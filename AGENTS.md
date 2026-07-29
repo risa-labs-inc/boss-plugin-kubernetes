@@ -102,11 +102,73 @@ cascade helpers** — no delete-all, no prune, no delete-namespace.
 ### Helm specifics
 
 **Every command reuses one plugin-owned terminal tab.** `KubeActions.openTerminal` first tries
-`runInExistingTerminal`, which reuses the tab recorded in `KubeServices.commandTerminal`
-(`switchToTab` then `sendCommand`), creating it only once. Two things it must not do: open a tab
-per command (the strip fills within minutes), or send into whatever tab is focused —
-`sendCommand` writes to the terminal's *active* tab, so without an owned tab a `helm upgrade`
-would be typed into the user's own shell session. Opening a fresh BOSS tab is the last resort.
+`runInExistingTerminal`, which reuses the tab recorded in `KubeServices.commandTerminal`,
+creating it only once. Two things it must not do: open a tab per command (the strip fills within
+minutes), or send into whatever tab is focused — `sendCommand` writes to the terminal's *active*
+tab, so without an owned tab a `helm upgrade` would be typed into the user's own shell session.
+Opening a fresh BOSS tab is the last resort.
+
+The sequence is `switchToTab` → **`sendInterrupt`** → 500 ms → `sendCommand`, matching what
+terminal-tab does for a re-run. The interrupt is not cosmetic: `sendCommand` writes to the pty,
+so with a foreground process still running (a `helm install --wait`, an `exec -it`) the text goes
+to *that process's stdin* and never runs, while the caller still gets `true` and reports success
+for a command that vanished. The API exposes no idle/running signal, so interrupting is the
+best available way to *make it likely* the shell is the reader — it narrows the window, it does
+not close it. A process that survives both SIGINTs (a `kubectl apply` blocked on a slow API
+server, a pager, a password prompt) still receives the text, and `sendCommand` returning true
+means "written to the pty", not "the shell read it". Safe here because the tab only ever holds this plugin's
+own commands. What that costs is said **prospectively** — the `helm_*` tools name it, including
+that interrupting a `--wait` leaves the release pending — rather than by a notification after the
+fact: with no liveness signal there is nothing to gate one on, so every guard written for one was
+either vacuous or fired on every command (boss-plugins#11).
+
+**`kubectl exec -it` never shares the tab.** Ctrl-C is not a universal "stop that": under
+`exec -it` kubectl holds the local terminal in raw mode and *forwards* 0x03 to the remote
+process, so the container's shell takes the SIGINT and prints a prompt while kubectl keeps
+owning the pty. The interrupt that makes reuse safe for everything else does nothing here, and
+the next command would be typed **into the container's shell** — in a pod with kubectl and a
+mounted service-account token that runs against the cluster with the *pod's* credentials, and
+the sidebar would report success. Hence `TerminalCommandKind`: `Interactive` gets its own
+sub-tab and is never recorded as owned; `Batch` shares. Classify a new terminal command by what
+holds the pty, not by what looks tidiest — if Ctrl-C will not free it, it is `Interactive`.
+
+**`openTerminal` returning true means "accepted for delivery", not "running".** The command is
+queued; the consumer types it later, after the interrupt sequence and after anything ahead of it.
+So anything timed from that return is wrong (see `onDelivered` below), and a command can still
+fall back to a BOSS tab — or fail — after its caller was told it launched. The `helm_*` and `k8s_*`
+tools hedge their wording for this and name what interrupting costs, which is where the warning
+belongs: prospectively, while the caller can still act on it. There is deliberately **no** toast
+after the fact — with no liveness signal there is nothing to gate one on, so it fired on every
+command and became noise (boss-plugins#11).
+
+**No API-version floor was raised for the terminal reuse.** Everything it uses predates the
+declared `minApiVersion` 1.0.48: `getPluginAPI`, `PluginContext.windowId`, `ActiveTabData.windowId`,
+`hasTerminalState`, `sendCommand` and `sendInterrupt` land in `boss-plugin-api` **1.0.16**, and
+`TerminalTabPluginAPI` / `createTab` / `switchToTab` / `listTabs` in **1.0.23**. The
+`runCatching { Throwable }` wrap is not the compatibility contract — it is there for the case that
+terminal-tab simply is not loaded, which logs rather than degrading in silence.
+
+**Commands are delivered through a single-consumer `Channel`, not a lock.** `runInExistingTerminal`
+only decides *whether* a terminal exists and enqueues; one coroutine drains the queue and performs
+every switch/interrupt/wait/send. This is load-bearing twice over. A `synchronized` block that
+holds across the interrupt but `launch`es the send does not work — a second command's interrupt
+then lands before the first has been typed, so the first runs and the second is swallowed, which
+is the original bug one step later. And the sequence must not run on the UI thread: panel clicks
+call `openTerminal` directly, and the body makes cross-plugin calls whose threading contract this
+plugin does not control, so a blocking monitor there risks parking the UI thread. One consumer also means
+`ownedTerminal` is confined to it and lives privately in `KubeActions` rather than on the shared
+services object, where any call site could retarget the tab without queueing; the `@Volatile` on
+it is belt-and-braces for a caller-side read that no longer exists, not a live requirement.
+
+The working directory is never implicit: it defaults to `projectPath`, because on reuse the tab
+sits wherever the last command left it and a relative `-f ./manifest.yaml` would resolve against
+the wrong project.
+
+**Anything timed after a terminal command must hang off `onDelivered`, not `openTerminal`'s
+return.** That return now means "queued", not "typed" — delivery costs the interrupt sequence
+plus every command ahead of it in the queue. `HelmActions.runHelmTerminal` learned this the hard
+way: `scheduleHelmRefresh()`'s 2.5 s settle was being counted from acceptance, so the release
+list could refresh before helm had started and leave the sidebar on the pre-upgrade state.
 
 **Helm 4 removed and renamed CLI surface**, all verified against 4.2.3 rather than assumed:
 

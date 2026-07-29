@@ -253,25 +253,31 @@ class HelmMcpToolProvider(
                 val chart = resolveChart(args) ?: return@McpToolHandler chartNotFound(args)
                 val dest = args.string("destination") ?: chart.directory.parent ?: chart.directory.absolutePath
                 if (actions.packageChart(chart, dest)) {
-                    McpToolResult("Packaging ${chart.name} into $dest in a terminal tab.")
+                    McpToolResult("Packaging ${chart.name} into $dest in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    // Cause-agnostic on purpose. Not the "no terminal" path (the consumer
+                    // handles that by opening a BOSS tab) and not a post-dispose path
+                    // either, since openTerminal falls through to splitViewOperations and
+                    // returns true there. What reaches here is a host with no
+                    // splitViewOperations — naming a cause would be specific and usually
+                    // wrong.
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
 
         McpToolDefinition(
             name = "helm_dependency_update",
-            description = "Fetch a chart's declared dependencies into charts/, in a terminal tab.",
+            description = "Fetch a chart's declared dependencies into charts/, in the plugin terminal tab — queued, so check the tab for the result.",
             inputSchema = chartSchema,
             readOnly = false,
             handler = McpToolHandler { args ->
                 requireHelm() ?: return@McpToolHandler helmError()
                 val chart = resolveChart(args) ?: return@McpToolHandler chartNotFound(args)
                 if (actions.dependencyUpdate(chart)) {
-                    McpToolResult("Updating dependencies for ${chart.name} in a terminal tab.")
+                    McpToolResult("Updating dependencies for ${chart.name} in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -294,9 +300,12 @@ class HelmMcpToolProvider(
                 val url = args.string("url")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: url", isError = true)
                 if (actions.repoAdd(name, url)) {
-                    McpToolResult("Adding repo $name ($url) in a terminal tab. This affects the whole machine.")
+                    McpToolResult(
+                        "Adding repo $name ($url) in the plugin terminal tab — queued, so check the " +
+                            "tab for the result. This affects the whole machine.",
+                    )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -308,9 +317,9 @@ class HelmMcpToolProvider(
             handler = McpToolHandler {
                 requireHelm() ?: return@McpToolHandler helmError()
                 if (actions.repoUpdate()) {
-                    McpToolResult("Updating chart repositories in a terminal tab.")
+                    McpToolResult("Updating chart repositories in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -342,7 +351,9 @@ class HelmMcpToolProvider(
 
         McpToolDefinition.withRbac(
             name = "helm_install",
-            description = "Install a chart as a new release, in a terminal tab. Use dry_run=true first.",
+            description = "Install a chart as a new release, in the plugin's shared terminal tab. " +
+                "Another terminal-routed command interrupts it, and interrupting a --wait leaves " +
+                "the release pending, so confirm with helm_releases. Use dry_run=true first.",
             inputSchema = """
                 {"type":"object","properties":{
                   "chart":{"type":"string","description":"Chart dir or Chart.yaml path"},
@@ -370,17 +381,23 @@ class HelmMcpToolProvider(
                     )
                 }
                 if (actions.install(chart, release, valuesFile)) {
-                    McpToolResult("Installing ${chart.name} as $release into ${target()} in a terminal tab.")
+                    McpToolResult(
+                        "Installing ${chart.name} as $release into ${target()} in the plugin's " +
+                            "terminal tab. Issuing another command interrupts it, and interrupting " +
+                            "a --wait leaves the release pending — confirm with helm_releases.",
+                    )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
 
         McpToolDefinition.withRbac(
             name = "helm_upgrade",
-            description = "Upgrade a release, in a terminal tab. chart may be a local path or a repo ref " +
-                "like metrics-server/metrics-server.",
+            description = "Upgrade a release, in the plugin's shared terminal tab. chart may be a " +
+                "local path or a repo ref like metrics-server/metrics-server. Issuing another " +
+                "kubectl or helm command interrupts it; interrupting a --wait leaves the release " +
+                "in pending-upgrade, so confirm with helm_releases rather than assuming.",
             inputSchema = """
                 {"type":"object","properties":{
                   "release":{"type":"string","description":"Release name"},
@@ -408,16 +425,20 @@ class HelmMcpToolProvider(
                     rollbackOnFailure = args.boolean("rollback_on_failure") ?: false,
                 )
                 if (launched) {
-                    McpToolResult("Upgrading $release in ${target()} in a terminal tab.")
+                    McpToolResult(
+                        "Upgrading $release in ${target()} in the plugin's terminal tab. Issuing " +
+                            "another command interrupts it, and interrupting a --wait leaves the " +
+                            "release pending — confirm with helm_releases.",
+                    )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
 
         McpToolDefinition.withRbac(
             name = "helm_rollback",
-            description = "Roll a release back to an earlier revision (see helm_history), in a terminal tab.",
+            description = "Roll a release back to an earlier revision (see helm_history), in the plugin terminal tab — queued, so check the tab for the result.",
             inputSchema = """
                 {"type":"object","properties":{
                   "release":{"type":"string","description":"Release name"},
@@ -437,7 +458,7 @@ class HelmMcpToolProvider(
                 if (actions.rollback(release, revision)) {
                     McpToolResult("Rolling $name back to revision $revision in ${target()}.")
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -460,9 +481,12 @@ class HelmMcpToolProvider(
                 val release = helm.findRelease(name)
                     ?: return@McpToolHandler McpToolResult("No release named '$name' in ${target()}.", isError = true)
                 if (actions.uninstall(release, args.boolean("keep_history") ?: false)) {
-                    McpToolResult("Uninstalling $name from ${target()} in a terminal tab.")
+                    McpToolResult(
+                        "Uninstalling $name from ${target()} in the plugin's terminal tab. Issuing " +
+                            "another command interrupts it — confirm with helm_releases.",
+                    )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -480,9 +504,9 @@ class HelmMcpToolProvider(
                 val release = helm.findRelease(name)
                     ?: return@McpToolHandler McpToolResult("No release named '$name' in ${target()}.", isError = true)
                 if (actions.test(release)) {
-                    McpToolResult("Running tests for $name in ${target()} in a terminal tab.")
+                    McpToolResult("Running tests for $name in ${target()} in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
@@ -514,10 +538,10 @@ class HelmMcpToolProvider(
                 val plainHttp = args.boolean("plain_http") ?: false
                 if (actions.push(file.absolutePath, dest, plainHttp)) {
                     McpToolResult(
-                        "Pushing ${file.name} to $dest${if (plainHttp) " over plain HTTP" else ""} in a terminal tab.",
+                        "Pushing ${file.name} to $dest${if (plainHttp) " over plain HTTP" else ""} in the plugin terminal tab — queued, so check the tab for the result.",
                     )
                 } else {
-                    McpToolResult("Couldn't open a terminal tab.", isError = true)
+                    McpToolResult("Couldn't start the command.", isError = true)
                 }
             },
         ),
