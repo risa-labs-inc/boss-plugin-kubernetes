@@ -8,15 +8,55 @@ import ai.rever.boss.plugin.api.McpToolResult
 import java.io.File
 
 /**
+ * Every MCP tool provider this plugin contributes, in registration order.
+ *
+ * The one place the set is written down. [KubernetesDynamicPlugin.register] registers
+ * exactly this, and `McpToolGatingTest` audits exactly this — a third provider added
+ * here is gated-or-justified like the rest, whereas a test that named the providers
+ * itself would simply not see it.
+ *
+ * Two providers rather than one so Helm can be absent without affecting the
+ * kubectl-backed tools.
+ */
+fun mcpToolProviders(pluginId: String, services: KubeServices): List<McpToolProvider> = listOf(
+    KubeMcpToolProvider(pluginId, services),
+    HelmMcpToolProvider("$pluginId.helm", services),
+)
+
+/**
  * `k8s_*` tools for in-terminal agents, surfacing as `mcp__boss__k8s_*`.
  *
  * Two rules hold across all of them:
  *
- * - **Every answer states the context and namespace it came from.** An agent
- *   reading "3 pods" without knowing which cluster is a hazard, not a help.
- * - **Mutating tools are gated on `kubernetes.manage`** via `withRbac` (never
- *   `.copy()`, which silently drops the gate). Admins hold every permission, so a
- *   signed-in admin sees them immediately.
+ * - **Every answer about cluster or release state names the context and namespace it
+ *   came from.** An agent reading "3 pods" without knowing which cluster is a
+ *   hazard, not a help. That includes the YAML-bodied replies, which carry it as a
+ *   `# context / namespace` comment so the body still parses, and `k8s_forwards`,
+ *   which names it per row because forwards outlive a context switch. The tools that
+ *   answer about the *project* or the local helm config — `k8s_manifests`,
+ *   `helm_charts`, `helm_template`, `helm_repos`, `helm_search`, `helm_package` —
+ *   have no cluster target to name, and that is the whole exception.
+ *
+ *   This was not true for `k8s_logs`, `k8s_yaml`, `k8s_api_resources`, `helm_values`,
+ *   `helm_manifest`, `helm_notes` and several tab/teardown replies until 2026-08. The
+ *   named target is what makes an ungated `k8s_use_context` survivable — retarget to
+ *   prod, then read prod values with nothing saying prod was the actual gap — so
+ *   treat a cluster reply without one as a bug.
+ * - **Mutating tools are permission-gated** via `withRbac` (never `.copy()`, which
+ *   silently drops the gate): `kubernetes.manage` for cluster mutation,
+ *   `kubernetes.exec` for the pod shell, `kubernetes.portforward` for opening a
+ *   network path in. Admins hold every permission, so a signed-in admin sees them
+ *   immediately; with nobody signed in, a gated tool is not exposed at all.
+ *
+ * A handful of `readOnly = false` tools are deliberately ungated — they select a
+ * target, open a tab, or move bytes locally rather than changing the cluster. That
+ * set is not a matter of taste: `McpToolGatingTest` pins the whole inventory (gated,
+ * ungated-by-design and read-only alike) and fails on any tool that is not in one of
+ * the three tables. Adding a tool without deciding breaks the build — including the
+ * easy mistake, which is omitting `readOnly` altogether, since it defaults to `true`.
+ *
+ * None of this is a sandbox. It narrows *these* tools; an agent that can open a
+ * terminal can still run `kubectl` itself (`mcp__boss__run_command` is ungated).
  */
 class KubeMcpToolProvider(
     override val providerId: String,
@@ -51,8 +91,9 @@ class KubeMcpToolProvider(
 
         McpToolDefinition(
             name = "k8s_use_context",
-            description = "Point this plugin at a different context and/or namespace. Local to BOSS — " +
-                "your shells' kubectl default is left alone.",
+            description = "Point this plugin at a different context and/or namespace, for this session. " +
+                "Local to BOSS — your shells' kubectl default is left alone. Note this moves the " +
+                "selection the sidebar shows too, so the reply names where you have landed.",
             inputSchema = """
                 {"type":"object","properties":{
                   "context":{"type":"string","description":"Context name (see k8s_contexts)"},
@@ -63,7 +104,12 @@ class KubeMcpToolProvider(
             handler = McpToolHandler { args ->
                 args.string("context")?.let { engine.selectContext(it) }
                 args.string("namespace")?.let { engine.selectNamespace(it) }
-                services.rememberTarget()
+                // Deliberately NOT services.rememberTarget(). The selection is shared with
+                // the sidebar, so an agent retargeting it already moves what the human is
+                // looking at; persisting it as well would carry an agent's choice across
+                // restarts, so the next session opens on a cluster nobody chose. The panel
+                // still persists the human's own switches (KubePanelViewModel), which is
+                // where a durable preference should come from.
                 val state = engine.probeCluster()
                 McpToolResult("Now pointed at ${engine.target.value.display} (${stateLabel(state)}).")
             },
@@ -77,7 +123,7 @@ class KubeMcpToolProvider(
                 engine.refreshNamespaces()
                 val rows = engine.namespaces.value
                 McpToolResult(
-                    "${engine.target.context()}\n" +
+                    "${engine.target.display()}\n" +
                         rows.joinToString("\n") { "${it.name}  ${it.phase}" }.ifBlank { "No namespaces." },
                 )
             },
@@ -112,8 +158,13 @@ class KubeMcpToolProvider(
             """.trimIndent(),
             handler = McpToolHandler { args ->
                 requireReady() ?: return@McpToolHandler clusterError()
-                val kind = args.string("kind")
+                val requested = args.string("kind")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: kind", isError = true)
+                // Refuse the spelling before anything looks at it. `secrets,pods` is a
+                // valid kubectl type *list*, so passing it through would ask for Secret
+                // payloads from a tool that is read-only and ungated.
+                val kind = KubeActions.normalizeKind(requested)
+                    ?: return@McpToolHandler McpToolResult(KubeActions.KIND_REFUSAL, isError = true)
                 val output = args.string("output")?.lowercase() ?: "wide"
 
                 if (KubeActions.isSecretKind(kind)) {
@@ -170,7 +221,7 @@ class KubeMcpToolProvider(
                 }
                 val result = KubectlCli.exec(engine.args(cmd), timeoutMs = 25_000)
                 if (result.ok) {
-                    McpToolResult(result.stdout.ifBlank { "(no output)" })
+                    McpToolResult("${engine.target.display()}\n" + result.stdout.ifBlank { "(no output)" })
                 } else {
                     McpToolResult(result.cleanError, isError = true)
                 }
@@ -202,7 +253,11 @@ class KubeMcpToolProvider(
                 requireReady() ?: return@McpToolHandler clusterError()
                 val (kind, name) = args.kindAndName() ?: return@McpToolHandler missingArgs()
                 val result = services.actions.yaml(kind, name)
-                if (result.ok) McpToolResult(result.stdout) else McpToolResult(result.cleanError, isError = true)
+                if (result.ok) {
+                    McpToolResult(engine.target.yamlHeader() + result.stdout)
+                } else {
+                    McpToolResult(result.cleanError, isError = true)
+                }
             },
         ),
 
@@ -236,36 +291,18 @@ class KubeMcpToolProvider(
                     engine.args(listOf("api-resources", "--verbs=list"), namespaced = false),
                     timeoutMs = 25_000,
                 )
-                if (result.ok) McpToolResult(result.stdout.trim()) else McpToolResult(result.cleanError, isError = true)
-            },
-        ),
-
-        McpToolDefinition(
-            name = "k8s_port_forward",
-            description = "Start a supervised port-forward and return the local URL. It restarts itself if " +
-                "the connection drops, and is torn down when the plugin unloads.",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "target":{"type":"string","description":"kind/name, e.g. service/api or pod/api-abc123"},
-                  "remote_port":{"type":"integer","description":"Port on the target"},
-                  "local_port":{"type":"integer","description":"Preferred local port (default: a free one)"}
-                },"required":["target","remote_port"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireReady() ?: return@McpToolHandler clusterError()
-                val target = args.string("target")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: target", isError = true)
-                val remote = args.int("remote_port")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: remote_port", isError = true)
-                val local = services.forwards.start(target, remote, args.int("local_port"))
-                McpToolResult("Forwarding $target :$remote → http://localhost:$local (${engine.target.display()})")
+                if (result.ok) {
+                    McpToolResult("${engine.target.display()}\n${result.stdout.trim()}")
+                } else {
+                    McpToolResult(result.cleanError, isError = true)
+                }
             },
         ),
 
         McpToolDefinition(
             name = "k8s_port_forward_stop",
-            description = "Stop a port-forward started by this plugin, or all of them.",
+            description = "Stop a port-forward started by this plugin, or all of them. Ungated even " +
+                "though starting one needs kubernetes.portforward — stopping only ever reduces reach.",
             inputSchema = """
                 {"type":"object","properties":{
                   "target":{"type":"string","description":"kind/name; omit with all=true"},
@@ -277,7 +314,7 @@ class KubeMcpToolProvider(
             handler = McpToolHandler { args ->
                 if (args.boolean("all") == true) {
                     services.forwards.stopAll()
-                    return@McpToolHandler McpToolResult("Stopped all port-forwards.")
+                    return@McpToolHandler McpToolResult("Stopped all port-forwards (${engine.target.display()}).")
                 }
                 val target = args.string("target")
                     ?: return@McpToolHandler McpToolResult("Missing required argument: target", isError = true)
@@ -285,7 +322,7 @@ class KubeMcpToolProvider(
                     ?: return@McpToolHandler McpToolResult("Missing required argument: remote_port", isError = true)
                 val t = engine.target.value
                 services.forwards.stop(ForwardKey(t.context, t.namespace, target, remote))
-                McpToolResult("Stopped forwarding $target :$remote")
+                McpToolResult("Stopped forwarding $target :$remote (${t.display}).")
             },
         ),
 
@@ -295,10 +332,13 @@ class KubeMcpToolProvider(
             handler = McpToolHandler {
                 val rows = services.forwards.forwards.value.values
                 if (rows.isEmpty()) return@McpToolHandler McpToolResult("No active port-forwards.")
+                // Per-row target rather than a header: forwards outlive a k8s_use_context
+                // switch, so this list can span contexts and one header would be a lie.
                 McpToolResult(
                     rows.joinToString("\n") { f ->
                         "${f.key.ref} :${f.key.remotePort} → localhost:${f.localPort}  " +
-                            "${f.status.name.lowercase()}  restarts=${f.restarts}  ns=${f.key.namespace}"
+                            "${f.status.name.lowercase()}  restarts=${f.restarts}  " +
+                            "${f.key.context ?: "no context"} / ${f.key.namespace}"
                     },
                 )
             },
@@ -316,79 +356,6 @@ class KubeMcpToolProvider(
         ),
 
         McpToolDefinition(
-            name = "k8s_apply",
-            description = "Apply a manifest or kustomization in the plugin's shared terminal tab. " +
-                "Another terminal-routed command (apply, diff, or a helm mutation) interrupts it; " +
-                "the read tools do not, so confirming with k8s_get is safe. Use dry_run=true first " +
-                "to see what would change without changing it.",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "path":{"type":"string","description":"Manifest file or kustomization dir (absolute, or relative to the project)"},
-                  "dry_run":{"type":"boolean","description":"Server-side dry run (default false)"}
-                },"required":["path"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireReady() ?: return@McpToolHandler clusterError()
-                val path = args.string("path")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: path", isError = true)
-                val file = resolveProjectFile(path)
-                    ?: return@McpToolHandler McpToolResult("Not found: $path", isError = true)
-                val kind = if (file.isDirectory || file.name.startsWith("kustomization")) {
-                    ManifestArtifact.Kind.KUSTOMIZATION
-                } else {
-                    ManifestArtifact.Kind.MANIFEST
-                }
-                val artifact = ManifestArtifact(file, kind, file.name)
-                val dryRun = args.boolean("dry_run") ?: false
-                if (services.actions.apply(artifact, dryRun = dryRun)) {
-                    McpToolResult(
-                        "${if (dryRun) "Dry-run applying" else "Applying"} ${file.absolutePath} " +
-                            "to ${engine.target.display()} in the plugin terminal tab — queued, so check the tab for the result.",
-                    )
-                } else {
-                    McpToolResult("Couldn't start the command.", isError = true)
-                }
-            },
-        ),
-
-        McpToolDefinition(
-            name = "k8s_exec",
-            description = "Open an interactive shell in a pod, in its own terminal tab (exec -it needs " +
-                "a real TTY, and Ctrl-C is forwarded into the pod rather than freeing the tab, so it " +
-                "never shares the plugin's shared one).",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "pod":{"type":"string","description":"Pod name"},
-                  "container":{"type":"string","description":"Container name"},
-                  "shell":{"type":"string","description":"Shell to run (default sh)"}
-                },"required":["pod"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireReady() ?: return@McpToolHandler clusterError()
-                val podName = args.string("pod")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: pod", isError = true)
-                val pod = PodInfo(
-                    name = podName,
-                    namespace = engine.target.value.namespace,
-                    phase = "", readyContainers = 0, totalContainers = 0, restarts = 0,
-                    node = "", createdAt = "", containers = emptyList(), initContainers = emptyList(),
-                )
-                val opened = services.actions.exec(
-                    pod = pod,
-                    container = args.string("container"),
-                    shell = args.string("shell") ?: "sh",
-                )
-                if (opened) {
-                    McpToolResult("Opened a shell in $podName (${engine.target.display()}).")
-                } else {
-                    McpToolResult("Couldn't start the command.", isError = true)
-                }
-            },
-        ),
-
-        McpToolDefinition(
             name = "k8s_open_resource",
             description = "Open the BOSS resource tab for an object — logs, preview, describe, YAML and events.",
             inputSchema = kindNameSchema,
@@ -397,9 +364,12 @@ class KubeMcpToolProvider(
                 val (kind, name) = args.kindAndName() ?: return@McpToolHandler missingArgs()
                 when (services.openResourceTabVerified(kind, name)) {
                     TabOpenOutcome.Opened -> McpToolResult("Opened the $kind/$name tab (${engine.target.display()}).")
-                    TabOpenOutcome.Focused -> McpToolResult("Focused the existing $kind/$name tab.")
-                    TabOpenOutcome.Unverifiable ->
-                        McpToolResult("Requested the $kind/$name tab (couldn't confirm it opened).")
+                    TabOpenOutcome.Focused ->
+                        McpToolResult("Focused the existing $kind/$name tab (${engine.target.display()}).")
+                    TabOpenOutcome.Unverifiable -> McpToolResult(
+                        "Requested the $kind/$name tab for ${engine.target.display()} " +
+                            "(couldn't confirm it opened).",
+                    )
                     TabOpenOutcome.Dropped -> McpToolResult(
                         "The host dropped the tab — no factory registered for " +
                             "'${KubeResourceTabType.typeId.typeId}'. Reload the Kubernetes plugin from Toolbox.",
@@ -477,6 +447,144 @@ class KubeMcpToolProvider(
                 }
             },
         ),
+
+        McpToolDefinition.withRbac(
+            name = "k8s_apply",
+            description = "Apply a manifest or kustomization in the plugin's shared terminal tab. " +
+                "Another terminal-routed command (apply, diff, or a helm mutation) interrupts it; " +
+                "the read tools do not, so confirming with k8s_get is safe. Use dry_run=true first " +
+                "to see what would change without changing it.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "path":{"type":"string","description":"Manifest file or kustomization dir (absolute, or relative to the project)"},
+                  "dry_run":{"type":"boolean","description":"Server-side dry run (default false)"}
+                },"required":["path"]}
+            """.trimIndent(),
+            readOnly = false,
+            // Unrestricted object creation, including cluster-scoped RBAC objects, so it
+            // reaches at least as far as k8s_delete. `kubernetes.manage` rather than a
+            // permission of its own because `helm_install` already creates arbitrary
+            // objects from a chart under this same permission: a separate `kubernetes.apply`
+            // would gate the manifest spelling of a capability that stays reachable via
+            // Helm, which is a distinction the permission model does not actually make.
+            // dry_run is not a lesser case — it is an argument the caller chooses, so
+            // gating on it would be a gate the caller controls.
+            requiredPermissions = listOf(PERMISSION_MANAGE),
+            handler = McpToolHandler { args ->
+                requireReady() ?: return@McpToolHandler clusterError()
+                val path = args.string("path")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: path", isError = true)
+                val file = resolveProjectFile(path)
+                    ?: return@McpToolHandler McpToolResult("Not found: $path", isError = true)
+                val kind = if (file.isDirectory || file.name.startsWith("kustomization")) {
+                    ManifestArtifact.Kind.KUSTOMIZATION
+                } else {
+                    ManifestArtifact.Kind.MANIFEST
+                }
+                val artifact = ManifestArtifact(file, kind, file.name)
+                val dryRun = args.boolean("dry_run") ?: false
+                if (services.actions.apply(artifact, dryRun = dryRun)) {
+                    McpToolResult(
+                        "${if (dryRun) "Dry-run applying" else "Applying"} ${file.absolutePath} " +
+                            "to ${engine.target.display()} in the plugin terminal tab — queued, so check the tab for the result.",
+                    )
+                } else {
+                    McpToolResult("Couldn't start the command.", isError = true)
+                }
+            },
+        ),
+
+        McpToolDefinition.withRbac(
+            name = "k8s_exec",
+            description = "Open an interactive shell in a pod, in its own terminal tab (exec -it needs " +
+                "a real TTY, and Ctrl-C is forwarded into the pod rather than freeing the tab, so it " +
+                "never shares the plugin's shared one). Gated on kubernetes.exec, separately from " +
+                "the other mutations.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "pod":{"type":"string","description":"Pod name"},
+                  "container":{"type":"string","description":"Container name"},
+                  "shell":{"type":"string","description":"Shell to run (default sh)"}
+                },"required":["pod"]}
+            """.trimIndent(),
+            readOnly = false,
+            // Its own permission, not `kubernetes.manage`, because a shell is a different
+            // kind of thing from "scale this deployment": it is arbitrary command execution
+            // inside the cluster with the pod's own service-account credentials, and it
+            // reads a mounted Secret or /var/run/secrets/.../token straight off the
+            // filesystem, around the redaction `k8s_yaml` and `redactRenderedYaml` apply.
+            //
+            // What this is NOT is a containment boundary against someone who already holds
+            // `kubernetes.manage`: they can apply a Job with `envFrom: secretRef` and a
+            // `command: ["env"]`, then read it back with the ungated `k8s_logs`. Anyone
+            // claiming otherwise is overselling it. The split earns its keep against a
+            // caller who holds *nothing* (which, with no user signed in, was every caller
+            // before this gate existed), and as accident-prevention and an audit signal
+            // for everyone else: "opened a shell in prod" is a distinct grant someone
+            // decided to make, not a side effect of being allowed to restart a deployment.
+            //
+            // Not `requiresAdmin`: "may shell into a pod" is a role, not a rank, and a
+            // named permission is what an admin can grant and revoke on its own.
+            requiredPermissions = listOf(PERMISSION_EXEC),
+            handler = McpToolHandler { args ->
+                requireReady() ?: return@McpToolHandler clusterError()
+                val podName = args.string("pod")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: pod", isError = true)
+                val pod = PodInfo(
+                    name = podName,
+                    namespace = engine.target.value.namespace,
+                    phase = "", readyContainers = 0, totalContainers = 0, restarts = 0,
+                    node = "", createdAt = "", containers = emptyList(), initContainers = emptyList(),
+                )
+                val opened = services.actions.exec(
+                    pod = pod,
+                    container = args.string("container"),
+                    shell = args.string("shell") ?: "sh",
+                )
+                if (opened) {
+                    McpToolResult("Opened a shell in $podName (${engine.target.display()}).")
+                } else {
+                    McpToolResult("Couldn't start the command.", isError = true)
+                }
+            },
+        ),
+
+        McpToolDefinition.withRbac(
+            name = "k8s_port_forward",
+            description = "Start a supervised port-forward and return the local URL. It restarts itself if " +
+                "the connection drops, and is torn down when the plugin unloads. Requires " +
+                "kubernetes.portforward.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "target":{"type":"string","description":"kind/name, e.g. service/api or pod/api-abc123"},
+                  "remote_port":{"type":"integer","description":"Port on the target"},
+                  "local_port":{"type":"integer","description":"Preferred local port (default: a free one)"}
+                },"required":["target","remote_port"]}
+            """.trimIndent(),
+            readOnly = false,
+            // Its own permission, because it is the one ungated tool that failed the bar
+            // the allow-list is supposed to enforce. A forward is not "the read tools over
+            // a different transport": it is an unmediated, bidirectional socket to a
+            // cluster-internal service, over whatever protocol that service speaks. The
+            // read tools can only read Kubernetes objects; a forward to an internal
+            // Postgres can DROP TABLE. Not `kubernetes.manage`, because it changes no
+            // cluster or machine state, and folding it in would make "may open a network
+            // path in" invisible inside "may scale a deployment".
+            //
+            // Stopping a forward stays ungated — see k8s_port_forward_stop. The sidebar's
+            // inline preview is unaffected: it calls PortForwardManager directly and never
+            // goes through the MCP registry.
+            requiredPermissions = listOf(PERMISSION_PORT_FORWARD),
+            handler = McpToolHandler { args ->
+                requireReady() ?: return@McpToolHandler clusterError()
+                val target = args.string("target")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: target", isError = true)
+                val remote = args.int("remote_port")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: remote_port", isError = true)
+                val local = services.forwards.start(target, remote, args.int("local_port"))
+                McpToolResult("Forwarding $target :$remote → http://localhost:$local (${engine.target.display()})")
+            },
+        ),
     )
 
     // --------------------------------------------------------------- helpers
@@ -522,6 +630,8 @@ class KubeMcpToolProvider(
 
     private companion object {
         const val PERMISSION_MANAGE = "kubernetes.manage"
+        const val PERMISSION_EXEC = "kubernetes.exec"
+        const val PERMISSION_PORT_FORWARD = "kubernetes.portforward"
 
         val kindNameSchema = """
             {"type":"object","properties":{
@@ -535,5 +645,11 @@ class KubeMcpToolProvider(
 /** `context / namespace` header line for tool output. */
 private fun kotlinx.coroutines.flow.StateFlow<KubeTarget>.display(): String = value.display
 
-/** Just the context name, for terser replies. */
-private fun kotlinx.coroutines.flow.StateFlow<KubeTarget>.context(): String = value.context ?: "no context"
+/**
+ * The same target as a YAML comment, for replies whose body is YAML.
+ *
+ * `k8s_yaml` and the Helm YAML tools have to name their target like everything else,
+ * but a bare header line would stop the output parsing as YAML for whoever asked. A
+ * comment satisfies both.
+ */
+private fun kotlinx.coroutines.flow.StateFlow<KubeTarget>.yamlHeader(): String = "# ${value.display}\n"

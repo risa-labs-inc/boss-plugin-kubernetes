@@ -42,10 +42,9 @@ class KubernetesDynamicPlugin : DynamicPlugin {
         context.tabRegistry.registerTabType(HelmReleaseTabType) { tabInfo, ctx ->
             HelmReleaseTabComponent(ctx, tabInfo, services)
         }
-        context.registerMcpToolProvider(KubeMcpToolProvider(pluginId, services))
-        // A second provider so the helm_* tools stand or fall on their own — helm
-        // being absent must not affect the kubectl-backed tools.
-        context.registerMcpToolProvider(HelmMcpToolProvider("$pluginId.helm", services))
+        // The provider list lives in mcpToolProviders() so the gating test audits the
+        // same set that gets registered here, third provider and all.
+        mcpToolProviders(pluginId, services).forEach(context::registerMcpToolProvider)
     }
 
     override fun dispose() {

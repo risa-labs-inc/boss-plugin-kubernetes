@@ -17,6 +17,17 @@ import java.io.File
  * Same contracts as the k8s side: replies name the context and namespace, mutating
  * tools are RBAC-gated via `withRbac` (never `.copy()`), and rendered output has
  * Secret payloads redacted.
+ *
+ * Release mutation takes `kubernetes.manage`; writing the machine's shared repo config
+ * takes `helm.repo`; pushing a chart off the machine takes `helm.publish`. The purely
+ * local steps (package, dependency fetch, repo cache refresh, opening a tab) are
+ * deliberately ungated — and `McpToolGatingTest` holds that line, pinning every tool
+ * here as gated, ungated-by-design, or read-only.
+ *
+ * Several of the ungated ones still *open a terminal tab* to do their work
+ * (`KubeActions.openTerminal`), which an agent with terminal access could then type
+ * into. That is not a new hole — `mcp__boss__run_command` is ungated, so such an agent
+ * already has a shell — but it is the reason none of this should be read as a sandbox.
  */
 class HelmMcpToolProvider(
     override val providerId: String,
@@ -82,7 +93,10 @@ class HelmMcpToolProvider(
             handler = McpToolHandler { args ->
                 requireReleaseAccess()?.let { return@McpToolHandler it }
                 val name = args.string("release") ?: return@McpToolHandler missingRelease()
-                McpToolResult(helm.values(name, args.boolean("all") ?: false))
+                // Named target, as a YAML comment so the body still parses. These are the
+                // values of a release in whatever context k8s_use_context last selected —
+                // "prod values, verbatim, with nothing saying prod" was the actual gap.
+                McpToolResult(yamlHeader() + helm.values(name, args.boolean("all") ?: false))
             },
         ),
 
@@ -93,7 +107,7 @@ class HelmMcpToolProvider(
             handler = McpToolHandler { args ->
                 requireReleaseAccess()?.let { return@McpToolHandler it }
                 val name = args.string("release") ?: return@McpToolHandler missingRelease()
-                McpToolResult(helm.manifest(name))
+                McpToolResult(yamlHeader() + helm.manifest(name))
             },
         ),
 
@@ -121,7 +135,7 @@ class HelmMcpToolProvider(
             handler = McpToolHandler { args ->
                 requireReleaseAccess()?.let { return@McpToolHandler it }
                 val name = args.string("release") ?: return@McpToolHandler missingRelease()
-                McpToolResult(helm.notes(name))
+                McpToolResult("${target()}\n${helm.notes(name)}")
             },
         ),
 
@@ -225,8 +239,10 @@ class HelmMcpToolProvider(
                 val name = args.string("release") ?: return@McpToolHandler missingRelease()
                 when (services.openReleaseTabVerified(name)) {
                     TabOpenOutcome.Opened -> McpToolResult("Opened the $name release tab (${target()}).")
-                    TabOpenOutcome.Focused -> McpToolResult("Focused the existing $name release tab.")
-                    TabOpenOutcome.Unverifiable -> McpToolResult("Requested the tab (couldn't confirm it opened).")
+                    TabOpenOutcome.Focused ->
+                        McpToolResult("Focused the existing $name release tab (${target()}).")
+                    TabOpenOutcome.Unverifiable ->
+                        McpToolResult("Requested the $name tab for ${target()} (couldn't confirm it opened).")
                     TabOpenOutcome.Dropped -> McpToolResult(
                         "The host dropped the tab — no factory for '${HelmReleaseTabType.typeId.typeId}'. " +
                             "Reload the Kubernetes plugin from Toolbox.",
@@ -283,34 +299,6 @@ class HelmMcpToolProvider(
         ),
 
         McpToolDefinition(
-            name = "helm_repo_add",
-            description = "Add a chart repository. NOTE: this writes ~/.config/helm/repositories.yaml, which is " +
-                "shared with your shells — the repo will exist outside BOSS too.",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "name":{"type":"string","description":"Local name for the repo"},
-                  "url":{"type":"string","description":"Repository URL"}
-                },"required":["name","url"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireHelm() ?: return@McpToolHandler helmError()
-                val name = args.string("name")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
-                val url = args.string("url")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: url", isError = true)
-                if (actions.repoAdd(name, url)) {
-                    McpToolResult(
-                        "Adding repo $name ($url) in the plugin terminal tab — queued, so check the " +
-                            "tab for the result. This affects the whole machine.",
-                    )
-                } else {
-                    McpToolResult("Couldn't start the command.", isError = true)
-                }
-            },
-        ),
-
-        McpToolDefinition(
             name = "helm_repo_update",
             description = "Refresh the local cache of all configured chart repositories.",
             readOnly = false,
@@ -320,29 +308,6 @@ class HelmMcpToolProvider(
                     McpToolResult("Updating chart repositories in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
                     McpToolResult("Couldn't start the command.", isError = true)
-                }
-            },
-        ),
-
-        McpToolDefinition(
-            name = "helm_repo_remove",
-            description = "Remove a chart repository. Also machine-wide.",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "name":{"type":"string","description":"Repo name to remove"}
-                },"required":["name"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireHelm() ?: return@McpToolHandler helmError()
-                val name = args.string("name")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
-                val result = actions.repoRemove(name)
-                helm.refreshRepos()
-                if (result.ok) {
-                    McpToolResult("Removed repo $name (machine-wide).")
-                } else {
-                    McpToolResult(result.cleanError, isError = true)
                 }
             },
         ),
@@ -512,6 +477,80 @@ class HelmMcpToolProvider(
         ),
 
         McpToolDefinition.withRbac(
+            name = "helm_repo_add",
+            description = "Add a chart repository. NOTE: this writes ~/.config/helm/repositories.yaml, which is " +
+                "shared with your shells — the repo will exist outside BOSS too.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "name":{"type":"string","description":"Local name for the repo"},
+                  "url":{"type":"string","description":"Repository URL"}
+                },"required":["name","url"]}
+            """.trimIndent(),
+            readOnly = false,
+            // `helm.repo`, NOT `kubernetes.manage`. Two reasons, one of them mechanical:
+            //
+            // 1. This is not cluster state. It writes ~/.config/helm/repositories.yaml,
+            //    which HelmActions keeps on the shared default on purpose, so the effect
+            //    outlives BOSS and shows up in the user's own shells. "May change the
+            //    cluster" never authorized that.
+            // 2. `register_plugin_permission` is insert-if-absent: a permission's
+            //    description is written once, at first publish, and later edits are a
+            //    no-op. So `kubernetes.manage`'s text is frozen at what admins already
+            //    granted, and widening what it authorizes while its description cannot
+            //    change means an admin grants it from stale text. Scope growth needs a new
+            //    name — the only kind of description that is ever actually inserted.
+            //
+            // It does not pretend to protect the supply chain from a `kubernetes.manage`
+            // holder, who can already `helm_upgrade release oci://anywhere/chart`. It keeps
+            // "may write the machine's shared helm config" separately grantable, which is
+            // the authority that is genuinely new here.
+            requiredPermissions = listOf(PERMISSION_REPO),
+            handler = McpToolHandler { args ->
+                requireHelm() ?: return@McpToolHandler helmError()
+                val name = args.string("name")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
+                val url = args.string("url")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: url", isError = true)
+                if (actions.repoAdd(name, url)) {
+                    McpToolResult(
+                        "Adding repo $name ($url) in the plugin terminal tab — queued, so check the " +
+                            "tab for the result. This affects the whole machine.",
+                    )
+                } else {
+                    McpToolResult("Couldn't start the command.", isError = true)
+                }
+            },
+        ),
+
+        McpToolDefinition.withRbac(
+            name = "helm_repo_remove",
+            description = "Remove a chart repository. Also machine-wide.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "name":{"type":"string","description":"Repo name to remove"}
+                },"required":["name"]}
+            """.trimIndent(),
+            readOnly = false,
+            // Same shared config as helm_repo_add, in the other direction: it deletes a
+            // registration the user's own shells depend on. De-registering is not
+            // self-evidently harmless — it breaks whatever resolves charts through that
+            // repo — so it is gated with the add rather than treated as a tidy-up.
+            requiredPermissions = listOf(PERMISSION_REPO),
+            handler = McpToolHandler { args ->
+                requireHelm() ?: return@McpToolHandler helmError()
+                val name = args.string("name")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
+                val result = actions.repoRemove(name)
+                helm.refreshRepos()
+                if (result.ok) {
+                    McpToolResult("Removed repo $name (machine-wide).")
+                } else {
+                    McpToolResult(result.cleanError, isError = true)
+                }
+            },
+        ),
+
+        McpToolDefinition.withRbac(
             name = "helm_push",
             description = "Push a packaged chart (.tgz) to an OCI registry. This publishes outside your machine, " +
                 "so it is gated separately and the reply names the destination.",
@@ -587,6 +626,9 @@ class HelmMcpToolProvider(
 
     private fun target(): String = kube.target.value.display
 
+    /** [target] as a YAML comment, for the replies whose body is YAML. */
+    private fun yamlHeader(): String = "# ${target()}\n"
+
     /**
      * Resolve a `chart` argument to a [ChartArtifact].
      *
@@ -629,6 +671,7 @@ class HelmMcpToolProvider(
 
     private companion object {
         const val PERMISSION_MANAGE = "kubernetes.manage"
+        const val PERMISSION_REPO = "helm.repo"
         const val PERMISSION_PUBLISH = "helm.publish"
 
         val releaseSchema = """

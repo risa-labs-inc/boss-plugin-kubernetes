@@ -12,7 +12,11 @@ preview backed by a supervised port-forward, describe, YAML and events.
 
 - **Plugin ID**: `ai.rever.boss.plugin.dynamic.kubernetes`
 - **Main Class**: `ai.rever.boss.plugin.dynamic.kubernetes.KubernetesDynamicPlugin`
-- **API Version**: 1.0.48 (`minApiVersion` 1.0.48 — needs the MCP tool-provider API)
+- **API Version**: 1.0.52 (`minApiVersion` 1.0.52 — the MCP tool-provider API lands in 1.0.48,
+  but `McpToolDefinition.withRbac` needs **1.0.52**: `McpToolDefinition$Companion` is absent
+  from the 1.0.48–1.0.51 jars, verified by listing their entries. Declaring 1.0.48 while
+  calling `withRbac` means `tools()` throws on such a host and the whole MCP surface vanishes,
+  gated tools included. Raise this floor whenever a gate uses newer API.)
 - **Type**: `mixed` (registers both a panel and a tab type)
 
 ## Essential Commands
@@ -64,6 +68,24 @@ uses `-o custom-columns` naming only metadata and type. Key names and sizes come
 `kubectl describe`, which prints `key: <n> bytes`. `KubeActions.yaml()` refuses Secrets
 outright, and `k8s_get` ignores `output=yaml` for them. You cannot leak what you never
 deserialize — keep it that way.
+
+**The Secret refusal decides about one resource type, so anything else is refused.** This was
+a real hole: `isSecretKind` used to be `kind.lowercase().trimEnd('s') == "secret"`, which asks
+whether the *whole argument* is the word "secret". kubectl's type syntax is
+`TYPE[.VERSION][.GROUP]` and it accepts a comma-joined list, so `secrets,pods`, `secret,pod`,
+`secrets.v1.` and `secrets ` all answered **false** and `k8s_get kind="secrets,pods"
+output=yaml` reached `kubectl get secrets,pods -o yaml` — from a tool that is read-only,
+ungated, and callable with nobody signed in. `normalizeKind` now refuses any `kind` that is not
+a single `TYPE[.VERSION][.GROUP]` token (no commas, whitespace or slashes), `isSecretKind`
+matches on the TYPE segment and **fails closed** on anything unparseable, and callers forward
+the *normalized* token rather than the raw string. `SecretKindGuardTest` holds every one of
+those spellings. A CRD such as `sealedsecrets.bitnami.com` is unaffected — only the TYPE
+segment decides.
+
+Two things follow. Never pattern-match a caller-supplied `kind` again; normalize, then decide.
+And note the kubectl half — that `get secrets,pods -o yaml` really emits Secret payloads — is
+read off kubectl's documented syntax and was **not** executed against a live API server, so the
+guard is written to refuse the spelling rather than to predict kubectl's behaviour.
 
 **`--request-timeout` on every server-touching call.** Without it an unreachable cluster hangs
 each call for the better part of a minute. `KubectlExec.cleanError` also strips kubectl's
@@ -253,21 +275,135 @@ one-line host change (call `dispose()` on disable, or emit `DISABLED`).
 
 ## MCP Tools
 
+The provider list lives in **`mcpToolProviders()`** — `register()` and `McpToolGatingTest` both
+consume it, so a third provider is audited like the first two. Never retype the list at a call
+site.
+
 kubectl side: `k8s_contexts`, `k8s_use_context`, `k8s_namespaces`, `k8s_pods`, `k8s_get`,
-`k8s_logs`, `k8s_describe`, `k8s_yaml`, `k8s_events`, `k8s_api_resources`, `k8s_port_forward`,
-`k8s_port_forward_stop`, `k8s_forwards`, `k8s_manifests`, `k8s_apply`, `k8s_exec`,
-`k8s_open_resource`, and the `kubernetes.manage`-gated `k8s_scale`, `k8s_rollout_restart`,
-`k8s_delete`.
+`k8s_logs`, `k8s_describe`, `k8s_yaml`, `k8s_events`, `k8s_api_resources`,
+`k8s_port_forward_stop`, `k8s_forwards`, `k8s_manifests`, `k8s_open_resource`, the
+`kubernetes.manage`-gated `k8s_apply`, `k8s_scale`, `k8s_rollout_restart`, `k8s_delete`, the
+`kubernetes.exec`-gated `k8s_exec` and the `kubernetes.portforward`-gated `k8s_port_forward`.
 
 Helm side: `helm_releases`, `helm_status`, `helm_values`, `helm_manifest`, `helm_history`,
 `helm_notes`, `helm_charts`, `helm_lint`, `helm_template`, `helm_repos`, `helm_search`,
-`helm_open_release`, `helm_package`, `helm_dependency_update`, `helm_repo_add`,
-`helm_repo_update`, `helm_repo_remove`, plus `kubernetes.manage`-gated `helm_install`,
-`helm_upgrade`, `helm_rollback`, `helm_uninstall`, `helm_test` and `helm.publish`-gated
+`helm_open_release`, `helm_package`, `helm_dependency_update`, `helm_repo_update`, plus
+`kubernetes.manage`-gated `helm_install`, `helm_upgrade`, `helm_rollback`, `helm_uninstall`,
+`helm_test`, `helm.repo`-gated `helm_repo_add` / `helm_repo_remove`, and `helm.publish`-gated
 `helm_push`.
 
-Every reply names the context and namespace it acted on. Gate mutating tools with
-`McpToolDefinition.withRbac(...)` — never `.copy()`, which drops the gate.
+Every reply **about cluster or release state** names the context and namespace it acted on —
+including the YAML-bodied ones, which carry it as a `# context / namespace` comment so the body
+still parses, and `k8s_forwards`, which names it per row because a forward outlives a context
+switch. The exception is the tools that answer about the *project* or the local helm config
+(`k8s_manifests`, `helm_charts`, `helm_template`, `helm_repos`, `helm_search`, `helm_package`),
+which have no cluster target to name.
+
+That was **not** true until 2026-08: `k8s_logs`, `k8s_yaml`, `k8s_api_resources`, `helm_values`,
+`helm_manifest`, `helm_notes` and several tab/teardown replies returned cluster payloads with
+nothing identifying the cluster, which is what made an ungated `k8s_use_context` genuinely
+dangerous — retarget to prod, then `helm_values release=payments all=true` and read prod values
+with no sign of prod. Treat a cluster reply that omits the target as a bug.
+
+Gate mutating tools with `McpToolDefinition.withRbac(...)` — never `.copy()`, which drops the
+gate.
+
+### The gating rule is enforced, not documented
+
+**Every tool must appear in exactly one of `GATED_TOOLS`, `UNGATED_BY_DESIGN` or
+`READ_ONLY_TOOLS`.** `src/test/kotlin/.../McpToolGatingTest.kt` builds the providers from
+`mcpToolProviders()` against a headless `PluginContext`, reads `readOnly` /
+`requiredPermissions` off the **real** `McpToolDefinition` objects, and fails `./gradlew build`
+on any tool that is in none of the three tables, in two of them, gated with permissions that
+don't match the pin, gated with a permission `plugin.json` doesn't declare or that the RBAC
+catalog's `domain.action` regex would reject, or duplicated across providers.
+
+Pinning the *whole inventory* — not just the mutating tools — is the load-bearing part.
+`readOnly` **defaults to `true`**, so the cheapest way to ship an ungated mutation is to omit
+both the permission and the `readOnly = false` line; a `readOnly`-keyed check passes such a tool
+without comment. Verified by inserting one: only the inventory assertion fired.
+
+Reflect over the objects; never scan source for gating. There are **two** factories,
+`McpToolDefinition(...)` and `McpToolDefinition.withRbac(...)`, and a scan keyed on the first
+silently skips exactly the gated set — that is how the audit in issue #3 nearly concluded that
+nothing was gated at all.
+
+What the test does *not* do: check this file or README.md. Both restate the split in prose and
+nothing verifies them — the tables are the source of truth. And a green build is not a review:
+widening `UNGATED_BY_DESIGN` is a one-line edit that passes, there is no CODEOWNERS, and the
+Claude review workflow runs on pull requests only while releases fire on push to `main`. The
+tables exist to put the decision in the diff, not to make it impossible.
+
+#### Never widen a permission's description — add a name
+
+`register_plugin_permission` (BossConsole migration `20260629000000`) is **insert-if-absent**:
+`p_description` is used only on the insert path, so editing the text of an already-registered
+permission is a permanent no-op in production. Widening what `kubernetes.manage` *authorizes*
+while its description is frozen means an admin grants it from stale text. So: new authority gets
+a new permission name, whose description does get inserted. `kubernetes.manage`'s text is
+deliberately left exactly as first published.
+
+Five permissions, and the reasoning for the split:
+
+- **`kubernetes.manage`** — changing cluster and release state: `k8s_apply`, `k8s_delete`,
+  `k8s_scale`, `k8s_rollout_restart`, and the Helm release lifecycle.
+- **`kubernetes.exec`** — `k8s_exec` alone: arbitrary in-cluster execution with the pod's
+  service-account credentials, reading its mounted Secrets around the redaction `k8s_yaml` and
+  `redactRenderedYaml` apply. It is **not** a containment boundary against someone holding
+  `kubernetes.manage`, who can apply a Job with `envFrom: secretRef` and `command: ["env"]` and
+  read the Secret back through the ungated `k8s_logs`. What the split buys is a gate against a
+  caller holding *nothing* (which, with no user signed in, was every caller before it existed),
+  plus accident-prevention and an audit signal. Not `requiresAdmin`: a role, not a rank.
+- **`kubernetes.portforward`** — `k8s_port_forward`. It changes no state, so it is not
+  `kubernetes.manage`; and it is not "a read tool over a different transport" either, which is
+  why it is no longer ungated: a forward is an unmediated bidirectional socket to a
+  cluster-internal service over whatever protocol that service speaks. A read tool can list a
+  Deployment; a forward to an internal database can write to it. Stopping a forward stays
+  ungated — teardown only reduces reach. The sidebar's inline preview is unaffected, since it
+  calls `PortForwardManager` directly and never goes through the MCP registry.
+- **`helm.repo`** — `helm_repo_add` / `helm_repo_remove`. Not cluster state: it writes the
+  shared `~/.config/helm/repositories.yaml`, so the effect outlives BOSS and shows up in the
+  user's own shells. Authority `kubernetes.manage` never had, hence its own name rather than a
+  description edit nobody would ever see. It does not pretend to protect the supply chain from a
+  `kubernetes.manage` holder, who can already `helm_upgrade release oci://anywhere/chart`.
+- **`helm.publish`** — `helm_push`, the only action that leaves the machine.
+
+`k8s_apply` deliberately stays on `kubernetes.manage` rather than getting a name of its own:
+`helm_install` already creates arbitrary objects from a chart under that permission — including
+cluster-scoped RBAC, as plenty of charts do — so a separate `kubernetes.apply` would gate one
+spelling of a capability that stays reachable via the other. It is a tool-list addition, not a
+scope widening, which is why it does not trip the rule above.
+
+Ungated mutating tools, and why: `k8s_use_context` (session-local target selection — never
+writes the kubeconfig, and the MCP path deliberately skips `rememberTarget()` so an agent's
+choice doesn't outlive the session; it *does* move the shared selection the sidebar shows, which
+is survivable only because every reply names its target, and gating it would stop a read-only
+agent from looking at a second namespace without closing the retarget-then-mutate path, since
+each mutating tool is gated on its own); `k8s_port_forward_stop` (only reduces reach);
+`k8s_open_resource` / `helm_open_release` (open a tab); `helm_package`,
+`helm_dependency_update`, `helm_repo_update` (local, project-scoped or cache-only, no new
+trust — registering a repo is the gated step, and these run in the plugin's own terminal tab).
+
+**None of this is a sandbox, and the UI is not gated at all.** RBAC here narrows *this plugin's
+MCP tools*, i.e. what an agent can do through them. `mcp__boss__run_command` in terminal-tab has
+no `requiredPermissions` anywhere in that repo, so an agent that cannot call `k8s_delete` can
+still shell out to `kubectl delete`. And the sidebar runs every mutation with no permission
+check whatsoever — that is the human at the keyboard, deliberately out of scope.
+
+#### Upgrading an existing install
+
+New permissions reach the RBAC catalog **only when the plugin is published to the store** —
+`definedPermissions` is registered by the plugin-store edge function at publish, and nothing
+registers it at install or load. Grants ride in the user's JWT, so a user needs to re-auth after
+being granted one. Net effect of this change for a non-admin:
+
+- `k8s_exec`, `k8s_port_forward`, `helm_repo_add` and `helm_repo_remove` go from
+  callable-by-anyone to **admin-only** until an admin grants `kubernetes.exec`,
+  `kubernetes.portforward` and `helm.repo` to their role.
+- Holding `kubernetes.manage` does **not** confer any of the three — that is the point.
+- A **side-loaded** jar in `~/.boss/plugins` never goes through publish, so those permissions
+  never enter the catalog at all and the tools stay admin-only indefinitely. Admins bypass every
+  gate, which is why this is easy to miss in local testing.
 
 ## Version Management
 
