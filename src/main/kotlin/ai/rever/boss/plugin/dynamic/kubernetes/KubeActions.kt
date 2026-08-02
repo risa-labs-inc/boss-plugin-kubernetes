@@ -713,7 +713,12 @@ class KubeActions(private val services: KubeServices) {
      * that renders a secret value.
      */
     suspend fun yaml(kind: String, name: String): KubectlExec {
-        if (isSecretKind(kind)) {
+        // Normalize before deciding, and send the normalized token to kubectl: a caller
+        // that asks for `secret,pod` must not have the raw string forwarded, since
+        // `kubectl get secret,pod <name> -o yaml` would answer for the Secret.
+        val token = normalizeKind(kind)
+            ?: return KubectlExec(exitCode = 1, stdout = "", stderr = KIND_REFUSAL)
+        if (isSecretKind(token)) {
             return KubectlExec(
                 exitCode = 1,
                 stdout = "",
@@ -721,7 +726,7 @@ class KubeActions(private val services: KubeServices) {
                     "Use Describe to see key names and sizes.",
             )
         }
-        return KubectlCli.exec(engine.args(listOf("get", kind.lowercase(), name, "-o", "yaml")), timeoutMs = 20_000)
+        return KubectlCli.exec(engine.args(listOf("get", token.lowercase(), name, "-o", "yaml")), timeoutMs = 20_000)
     }
 
     private suspend fun op(command: List<String>, timeoutMs: Long = 30_000): KubectlExec =
@@ -743,8 +748,53 @@ class KubeActions(private val services: KubeServices) {
         // sleep ~6 s and leave ten stray prompt lines. A liveness query on
         // TerminalTabPluginAPI would let an idle tab skip the interrupt entirely.
 
-        fun isSecretKind(kind: String): Boolean =
-            kind.lowercase().trimEnd('s') == "secret"
+        /**
+         * One kubectl `TYPE[.VERSION][.GROUP]` token, and nothing else.
+         *
+         * kubectl also accepts a comma-joined *list* of types — its own usage line is
+         * `TYPE[.VERSION][.GROUP]` and its help shows `kubectl get rc,services` — and
+         * `TYPE/NAME`. Neither is accepted here, because [isSecretKind] has to decide
+         * about one type at a time: `secrets,pods` is a request that includes Secrets,
+         * and any check that pattern-matches the whole string answers "not a Secret"
+         * about it. Refusing the spelling is what makes the Secret refusal structural
+         * instead of a guess.
+         */
+        private val KIND_TOKEN = Regex("^[A-Za-z][A-Za-z0-9.-]*$")
+
+        /** What to tell a caller whose `kind` [normalizeKind] rejected. */
+        const val KIND_REFUSAL: String =
+            "Give one resource type, as TYPE[.VERSION][.GROUP] — no commas, spaces or slashes. " +
+                "A comma-joined type list is refused because it would let Secrets ride along " +
+                "with a type that is allowed; ask for each type in its own call."
+
+        /**
+         * [kind] as a single usable resource type, or null when it is not one.
+         *
+         * Callers must refuse on null rather than hand the raw string to kubectl.
+         */
+        fun normalizeKind(kind: String): String? = kind.trim().takeIf { KIND_TOKEN.matches(it) }
+
+        /**
+         * Whether [kind] names core Secrets — erring towards yes.
+         *
+         * Anything [normalizeKind] rejects counts as a Secret request, because a refusal
+         * path has to fail closed. The check this replaces (`kind.lowercase().trimEnd('s')
+         * == "secret"`) failed *open* on every list spelling: `secrets,pods`,
+         * `secret,pod`, `secrets.v1.` and `secrets ` all answered false, so
+         * `k8s_get kind="secrets,pods" output=yaml` walked straight past it — from a tool
+         * that is read-only and ungated. Only the TYPE segment decides, so a CRD such as
+         * `sealedsecrets.bitnami.com` is unaffected.
+         *
+         * One honest limit: that `kubectl get secrets,pods -o yaml` really does print
+         * Secret payloads is read off kubectl's documented list syntax. It was not run
+         * against a live API server — no cluster was up — so the kubectl half is
+         * documented-but-unexecuted. The guard does not depend on it either way: it
+         * refuses the spelling rather than predicting what kubectl would do with it.
+         */
+        fun isSecretKind(kind: String): Boolean {
+            val token = normalizeKind(kind) ?: return true
+            return token.lowercase().substringBefore('.').trimEnd('s') == "secret"
+        }
 
         /**
          * Single-quote a value for the shell. Terminal tabs take a command *string*
