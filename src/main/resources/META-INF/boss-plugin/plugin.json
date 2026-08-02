@@ -3,8 +3,8 @@
   "pluginId": "ai.rever.boss.plugin.dynamic.kubernetes",
   "displayName": "Kubernetes",
   "version": "1.0.0",
-  "apiVersion": "1.0.48",
-  "minApiVersion": "1.0.48",
+  "apiVersion": "1.0.52",
+  "minApiVersion": "1.0.52",
   "minBossVersion": "9.2.35",
   "mainClass": "ai.rever.boss.plugin.dynamic.kubernetes.KubernetesDynamicPlugin",
   "type": "mixed",
@@ -21,11 +21,19 @@
   "definedPermissions": [
     {
       "name": "kubernetes.manage",
-      "description": "Change cluster state: apply manifests, delete, scale and restart Kubernetes resources, install, upgrade, roll back or uninstall Helm releases, and register or remove chart repositories"
+      "description": "Delete, scale and restart Kubernetes resources, and install, upgrade, roll back or uninstall Helm releases"
     },
     {
       "name": "kubernetes.exec",
-      "description": "Open an interactive shell inside a pod — arbitrary command execution in the cluster with that pod's credentials, including access to its mounted Secrets"
+      "description": "Open an interactive shell inside a pod — arbitrary command execution in the cluster with that pod's credentials, including reading its mounted Secrets"
+    },
+    {
+      "name": "kubernetes.portforward",
+      "description": "Forward a local port to a service or pod in the cluster, making an internal service reachable from this machine over any protocol it speaks"
+    },
+    {
+      "name": "helm.repo",
+      "description": "Add or remove Helm chart repositories in the shared ~/.config/helm config, which affects this machine outside BOSS"
     },
     {
       "name": "helm.publish",
