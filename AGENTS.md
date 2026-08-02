@@ -255,19 +255,63 @@ one-line host change (call `dispose()` on disable, or emit `DISABLED`).
 
 kubectl side: `k8s_contexts`, `k8s_use_context`, `k8s_namespaces`, `k8s_pods`, `k8s_get`,
 `k8s_logs`, `k8s_describe`, `k8s_yaml`, `k8s_events`, `k8s_api_resources`, `k8s_port_forward`,
-`k8s_port_forward_stop`, `k8s_forwards`, `k8s_manifests`, `k8s_apply`, `k8s_exec`,
-`k8s_open_resource`, and the `kubernetes.manage`-gated `k8s_scale`, `k8s_rollout_restart`,
-`k8s_delete`.
+`k8s_port_forward_stop`, `k8s_forwards`, `k8s_manifests`, `k8s_open_resource`, the
+`kubernetes.manage`-gated `k8s_apply`, `k8s_scale`, `k8s_rollout_restart`, `k8s_delete`, and
+the `kubernetes.exec`-gated `k8s_exec`.
 
 Helm side: `helm_releases`, `helm_status`, `helm_values`, `helm_manifest`, `helm_history`,
 `helm_notes`, `helm_charts`, `helm_lint`, `helm_template`, `helm_repos`, `helm_search`,
-`helm_open_release`, `helm_package`, `helm_dependency_update`, `helm_repo_add`,
-`helm_repo_update`, `helm_repo_remove`, plus `kubernetes.manage`-gated `helm_install`,
-`helm_upgrade`, `helm_rollback`, `helm_uninstall`, `helm_test` and `helm.publish`-gated
-`helm_push`.
+`helm_open_release`, `helm_package`, `helm_dependency_update`, `helm_repo_update`, plus
+`kubernetes.manage`-gated `helm_install`, `helm_upgrade`, `helm_rollback`, `helm_uninstall`,
+`helm_test`, `helm_repo_add`, `helm_repo_remove` and `helm.publish`-gated `helm_push`.
 
 Every reply names the context and namespace it acted on. Gate mutating tools with
 `McpToolDefinition.withRbac(...)` — never `.copy()`, which drops the gate.
+
+### The gating rule is enforced, not documented
+
+**Every `readOnly = false` tool must be permission-gated or explicitly allow-listed.**
+`src/test/kotlin/.../McpToolGatingTest.kt` constructs both providers against a headless
+`PluginContext`, reads `readOnly` / `requiredPermissions` off the **real** `McpToolDefinition`
+objects, and fails `./gradlew build` unless each mutating tool is either gated or named in
+`UNGATED_BY_DESIGN` with its reason. It also pins tool → permission (`GATED_TOOLS`), catches a
+gate downgraded to a weaker permission, and rejects a `requiredPermissions` value that
+`plugin.json`'s `definedPermissions` doesn't declare — an undeclared permission is never
+registered in the RBAC catalog at publish, so it can never be granted and the tool becomes
+admin-only forever.
+
+Reflect over the objects; never scan source for gating. There are **two** factories,
+`McpToolDefinition(...)` and `McpToolDefinition.withRbac(...)`, and a scan keyed on the first
+silently skips exactly the gated set — that is how the audit in issue #3 nearly concluded that
+nothing was gated at all.
+
+Three permissions, and the reasoning for the split:
+
+- **`kubernetes.manage`** — cluster/release mutation, plus the two `helm_repo_*` writes: those
+  land in the *shared* `~/.config/helm/repositories.yaml` and decide where charts resolve from,
+  and the second half of that move (`helm_upgrade release evil/chart`) already sits here.
+- **`kubernetes.exec`** — `k8s_exec` alone. A shell is a different kind of thing from an
+  operation: arbitrary in-cluster execution with the pod's service-account credentials, and the
+  only path around the Secret protections (`k8s_yaml` refuses Secrets, `redactRenderedYaml` masks
+  rendered ones, but a shell reads the mount). Not folded into `kubernetes.manage` so that
+  "may restart a workload" doesn't imply it; not `requiresAdmin`, because it is a role rather
+  than a rank.
+- **`helm.publish`** — `helm_push`, the only action that leaves the machine.
+
+`k8s_apply` deliberately stays on `kubernetes.manage` rather than getting a permission of its
+own: `helm_install` already creates arbitrary objects from a chart under that permission, so a
+separate `kubernetes.apply` would gate one spelling of a capability that stays reachable via
+the other.
+
+Ungated mutating tools, and why: `k8s_use_context` (in-memory selection, never writes the
+kubeconfig, and every reply names the target, so a retarget can't be silent — while gating it
+would stop a read-only agent from looking at a second namespace); `k8s_port_forward` /
+`k8s_port_forward_stop` (no cluster state, same credentials the read tools already use — a
+transport change, not an authority change; visible via `k8s_forwards`, and stopping one only
+reduces reach); `k8s_open_resource` / `helm_open_release` (open a tab); `helm_package`,
+`helm_dependency_update`, `helm_repo_update` (local, project-scoped or cache-only, no new trust
+— registering a repo is the gated step). Note the UI is not permission-gated at all; RBAC here
+covers the MCP surface, i.e. agents, not the human at the keyboard.
 
 ## Version Management
 

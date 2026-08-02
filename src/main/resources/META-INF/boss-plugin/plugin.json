@@ -21,7 +21,11 @@
   "definedPermissions": [
     {
       "name": "kubernetes.manage",
-      "description": "Delete, scale and restart Kubernetes resources, and install, upgrade, roll back or uninstall Helm releases"
+      "description": "Change cluster state: apply manifests, delete, scale and restart Kubernetes resources, install, upgrade, roll back or uninstall Helm releases, and register or remove chart repositories"
+    },
+    {
+      "name": "kubernetes.exec",
+      "description": "Open an interactive shell inside a pod — arbitrary command execution in the cluster with that pod's credentials, including access to its mounted Secrets"
     },
     {
       "name": "helm.publish",

@@ -74,16 +74,37 @@ namespace it came from:
 | `k8s_logs` | Pod or workload logs, with container and `previous` |
 | `k8s_describe` / `k8s_yaml` / `k8s_events` | Inspect one object (YAML refused for secrets) |
 | `k8s_port_forward` / `k8s_port_forward_stop` / `k8s_forwards` | Supervised forwards |
-| `k8s_manifests` / `k8s_apply` | Project manifests; apply in a terminal tab |
-| `k8s_exec` | Interactive shell in a pod, in a terminal tab |
+| `k8s_manifests` | Project manifests |
 | `k8s_open_resource` | Open the resource tab |
-| `k8s_scale` / `k8s_rollout_restart` / `k8s_delete` | Require `kubernetes.manage` |
+| `k8s_apply` / `k8s_scale` / `k8s_rollout_restart` / `k8s_delete` | Require `kubernetes.manage` |
+| `k8s_exec` | Interactive shell in a pod — requires `kubernetes.exec` |
 | `helm_releases` / `helm_status` / `helm_values` / `helm_manifest` / `helm_history` / `helm_notes` | Inspect releases (manifest redacted) |
 | `helm_charts` / `helm_lint` / `helm_template` | Project charts; render without a cluster |
-| `helm_repos` / `helm_search` / `helm_repo_add` / `helm_repo_update` / `helm_repo_remove` | Chart repositories |
-| `helm_install` / `helm_upgrade` / `helm_rollback` / `helm_uninstall` / `helm_test` | Require `kubernetes.manage` |
+| `helm_repos` / `helm_search` / `helm_repo_update` | Chart repositories (read + local cache refresh) |
+| `helm_install` / `helm_upgrade` / `helm_rollback` / `helm_uninstall` / `helm_test` / `helm_repo_add` / `helm_repo_remove` | Require `kubernetes.manage` |
 | `helm_package` / `helm_dependency_update` | Local packaging |
 | `helm_push` | Requires `helm.publish` — the only outward-facing action |
+
+### What is gated, and why that list can be trusted
+
+Three permissions, granted per role by an admin:
+
+- **`kubernetes.manage`** — changing the cluster: apply, delete, scale, restart, and every
+  Helm release mutation. Also `helm_repo_add`/`helm_repo_remove`, which write the *shared*
+  `~/.config/helm/repositories.yaml` and decide where charts come from.
+- **`kubernetes.exec`** — its own permission, because `k8s_exec` is not an operation but a
+  shell: arbitrary commands inside the cluster with the pod's service-account credentials,
+  and the one path that reads a mounted Secret directly rather than through this plugin's
+  redaction. Whoever may restart a workload should not get that for free.
+- **`helm.publish`** — pushing a chart off the machine.
+
+A mutating tool that is *not* gated is a decision, not an oversight: selecting a target
+(`k8s_use_context`, in-memory only), port-forwards (`k8s_port_forward*`, no cluster state
+and no authority the read tools don't have), opening a tab, and the local chart build steps.
+`McpToolGatingTest` enumerates the real tool objects and fails the build unless every
+mutating tool is either gated or on that allow-list with its reason, so this table cannot
+quietly drift from the code — see
+[issue #3](https://github.com/risa-labs-inc/boss-plugin-kubernetes/issues/3).
 
 ## Requirements
 
