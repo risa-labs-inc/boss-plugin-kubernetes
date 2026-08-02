@@ -14,9 +14,18 @@ import java.io.File
  *
  * - **Every answer states the context and namespace it came from.** An agent
  *   reading "3 pods" without knowing which cluster is a hazard, not a help.
- * - **Mutating tools are gated on `kubernetes.manage`** via `withRbac` (never
- *   `.copy()`, which silently drops the gate). Admins hold every permission, so a
- *   signed-in admin sees them immediately.
+ * - **Mutating tools are permission-gated** via `withRbac` (never `.copy()`, which
+ *   silently drops the gate): `kubernetes.manage` for cluster mutation, and
+ *   `kubernetes.exec` for `k8s_exec` alone, which is a shell rather than an
+ *   operation. Admins hold every permission, so a signed-in admin sees them
+ *   immediately; with nobody signed in, a gated tool is not exposed at all.
+ *
+ * A handful of `readOnly = false` tools are deliberately ungated — they select a
+ * target, open a tab, or move bytes locally rather than changing the cluster. That
+ * set is not a matter of taste: `McpToolGatingTest` enumerates the real tool
+ * objects and fails unless every mutating tool is either gated or on its
+ * explicitly-justified allow-list. Add a mutating tool without deciding and the
+ * build breaks.
  */
 class KubeMcpToolProvider(
     override val providerId: String,
@@ -316,79 +325,6 @@ class KubeMcpToolProvider(
         ),
 
         McpToolDefinition(
-            name = "k8s_apply",
-            description = "Apply a manifest or kustomization in the plugin's shared terminal tab. " +
-                "Another terminal-routed command (apply, diff, or a helm mutation) interrupts it; " +
-                "the read tools do not, so confirming with k8s_get is safe. Use dry_run=true first " +
-                "to see what would change without changing it.",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "path":{"type":"string","description":"Manifest file or kustomization dir (absolute, or relative to the project)"},
-                  "dry_run":{"type":"boolean","description":"Server-side dry run (default false)"}
-                },"required":["path"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireReady() ?: return@McpToolHandler clusterError()
-                val path = args.string("path")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: path", isError = true)
-                val file = resolveProjectFile(path)
-                    ?: return@McpToolHandler McpToolResult("Not found: $path", isError = true)
-                val kind = if (file.isDirectory || file.name.startsWith("kustomization")) {
-                    ManifestArtifact.Kind.KUSTOMIZATION
-                } else {
-                    ManifestArtifact.Kind.MANIFEST
-                }
-                val artifact = ManifestArtifact(file, kind, file.name)
-                val dryRun = args.boolean("dry_run") ?: false
-                if (services.actions.apply(artifact, dryRun = dryRun)) {
-                    McpToolResult(
-                        "${if (dryRun) "Dry-run applying" else "Applying"} ${file.absolutePath} " +
-                            "to ${engine.target.display()} in the plugin terminal tab — queued, so check the tab for the result.",
-                    )
-                } else {
-                    McpToolResult("Couldn't start the command.", isError = true)
-                }
-            },
-        ),
-
-        McpToolDefinition(
-            name = "k8s_exec",
-            description = "Open an interactive shell in a pod, in its own terminal tab (exec -it needs " +
-                "a real TTY, and Ctrl-C is forwarded into the pod rather than freeing the tab, so it " +
-                "never shares the plugin's shared one).",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "pod":{"type":"string","description":"Pod name"},
-                  "container":{"type":"string","description":"Container name"},
-                  "shell":{"type":"string","description":"Shell to run (default sh)"}
-                },"required":["pod"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireReady() ?: return@McpToolHandler clusterError()
-                val podName = args.string("pod")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: pod", isError = true)
-                val pod = PodInfo(
-                    name = podName,
-                    namespace = engine.target.value.namespace,
-                    phase = "", readyContainers = 0, totalContainers = 0, restarts = 0,
-                    node = "", createdAt = "", containers = emptyList(), initContainers = emptyList(),
-                )
-                val opened = services.actions.exec(
-                    pod = pod,
-                    container = args.string("container"),
-                    shell = args.string("shell") ?: "sh",
-                )
-                if (opened) {
-                    McpToolResult("Opened a shell in $podName (${engine.target.display()}).")
-                } else {
-                    McpToolResult("Couldn't start the command.", isError = true)
-                }
-            },
-        ),
-
-        McpToolDefinition(
             name = "k8s_open_resource",
             description = "Open the BOSS resource tab for an object — logs, preview, describe, YAML and events.",
             inputSchema = kindNameSchema,
@@ -477,6 +413,99 @@ class KubeMcpToolProvider(
                 }
             },
         ),
+
+        McpToolDefinition.withRbac(
+            name = "k8s_apply",
+            description = "Apply a manifest or kustomization in the plugin's shared terminal tab. " +
+                "Another terminal-routed command (apply, diff, or a helm mutation) interrupts it; " +
+                "the read tools do not, so confirming with k8s_get is safe. Use dry_run=true first " +
+                "to see what would change without changing it.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "path":{"type":"string","description":"Manifest file or kustomization dir (absolute, or relative to the project)"},
+                  "dry_run":{"type":"boolean","description":"Server-side dry run (default false)"}
+                },"required":["path"]}
+            """.trimIndent(),
+            readOnly = false,
+            // Unrestricted object creation, including cluster-scoped RBAC objects, so it
+            // reaches at least as far as k8s_delete. `kubernetes.manage` rather than a
+            // permission of its own because `helm_install` already creates arbitrary
+            // objects from a chart under this same permission: a separate `kubernetes.apply`
+            // would gate the manifest spelling of a capability that stays reachable via
+            // Helm, which is a distinction the permission model does not actually make.
+            // dry_run is not a lesser case — it is an argument the caller chooses, so
+            // gating on it would be a gate the caller controls.
+            requiredPermissions = listOf(PERMISSION_MANAGE),
+            handler = McpToolHandler { args ->
+                requireReady() ?: return@McpToolHandler clusterError()
+                val path = args.string("path")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: path", isError = true)
+                val file = resolveProjectFile(path)
+                    ?: return@McpToolHandler McpToolResult("Not found: $path", isError = true)
+                val kind = if (file.isDirectory || file.name.startsWith("kustomization")) {
+                    ManifestArtifact.Kind.KUSTOMIZATION
+                } else {
+                    ManifestArtifact.Kind.MANIFEST
+                }
+                val artifact = ManifestArtifact(file, kind, file.name)
+                val dryRun = args.boolean("dry_run") ?: false
+                if (services.actions.apply(artifact, dryRun = dryRun)) {
+                    McpToolResult(
+                        "${if (dryRun) "Dry-run applying" else "Applying"} ${file.absolutePath} " +
+                            "to ${engine.target.display()} in the plugin terminal tab — queued, so check the tab for the result.",
+                    )
+                } else {
+                    McpToolResult("Couldn't start the command.", isError = true)
+                }
+            },
+        ),
+
+        McpToolDefinition.withRbac(
+            name = "k8s_exec",
+            description = "Open an interactive shell in a pod, in its own terminal tab (exec -it needs " +
+                "a real TTY, and Ctrl-C is forwarded into the pod rather than freeing the tab, so it " +
+                "never shares the plugin's shared one). Gated on kubernetes.exec, separately from " +
+                "the other mutations.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "pod":{"type":"string","description":"Pod name"},
+                  "container":{"type":"string","description":"Container name"},
+                  "shell":{"type":"string","description":"Shell to run (default sh)"}
+                },"required":["pod"]}
+            """.trimIndent(),
+            readOnly = false,
+            // Its own permission, not `kubernetes.manage`, because a shell is a different
+            // kind of thing from "scale this deployment": it is arbitrary command execution
+            // inside the cluster with the pod's own service-account credentials, and it is
+            // the one path that walks around this plugin's Secret protections — `k8s_yaml`
+            // refuses Secrets and `redactRenderedYaml` masks rendered ones, but a shell
+            // reads a mounted Secret or /var/run/secrets/.../token straight off the
+            // filesystem. Whoever may restart a workload should not thereby get that.
+            // Not `requiresAdmin`: "may shell into a pod" is a role, not a rank, and a
+            // named permission is what an admin can grant and revoke on its own.
+            requiredPermissions = listOf(PERMISSION_EXEC),
+            handler = McpToolHandler { args ->
+                requireReady() ?: return@McpToolHandler clusterError()
+                val podName = args.string("pod")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: pod", isError = true)
+                val pod = PodInfo(
+                    name = podName,
+                    namespace = engine.target.value.namespace,
+                    phase = "", readyContainers = 0, totalContainers = 0, restarts = 0,
+                    node = "", createdAt = "", containers = emptyList(), initContainers = emptyList(),
+                )
+                val opened = services.actions.exec(
+                    pod = pod,
+                    container = args.string("container"),
+                    shell = args.string("shell") ?: "sh",
+                )
+                if (opened) {
+                    McpToolResult("Opened a shell in $podName (${engine.target.display()}).")
+                } else {
+                    McpToolResult("Couldn't start the command.", isError = true)
+                }
+            },
+        ),
     )
 
     // --------------------------------------------------------------- helpers
@@ -522,6 +551,7 @@ class KubeMcpToolProvider(
 
     private companion object {
         const val PERMISSION_MANAGE = "kubernetes.manage"
+        const val PERMISSION_EXEC = "kubernetes.exec"
 
         val kindNameSchema = """
             {"type":"object","properties":{

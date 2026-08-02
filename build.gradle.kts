@@ -32,14 +32,25 @@ repositories {
     maven("https://maven.pkg.jetbrains.space/public/p/compose/dev")
 }
 
+// Local development: pinned sibling JAR (symlinked next to the worktree).
+// CI: downloaded by the shared release workflow.
+val bossPluginApiJar = if (useLocalDependencies) {
+    files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.66.jar")
+} else {
+    files("build/downloaded-deps/boss-plugin-api.jar")
+}
+
 dependencies {
-    if (useLocalDependencies) {
-        // Local development: pinned sibling JAR (symlinked next to the worktree).
-        compileOnly(files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.66.jar"))
-    } else {
-        // CI: downloaded by the shared release workflow.
-        compileOnly(files("build/downloaded-deps/boss-plugin-api.jar"))
-    }
+    // compileOnly for main: the host classloader provides the API at runtime.
+    compileOnly(bossPluginApiJar)
+    // Tests, though, run outside the host and instantiate the real MCP tool
+    // providers, so they need the API on their own classpath — McpToolGatingTest
+    // reads `readOnly` / `requiredPermissions` off the actual McpToolDefinition
+    // objects rather than parsing source for two different factory spellings.
+    testImplementation(bossPluginApiJar)
+    testImplementation(kotlin("test"))
+    testImplementation("org.junit.jupiter:junit-jupiter:5.11.4")
+    testRuntimeOnly("org.junit.platform:junit-platform-launcher:1.11.4")
 
     // Compose dependencies
     implementation(compose.desktop.currentOs)
@@ -63,6 +74,15 @@ dependencies {
 
     // Parsing `kubectl ... -o json`
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.7.3")
+}
+
+tasks.test {
+    useJUnitPlatform()
+    testLogging {
+        events("failed")
+        showStandardStreams = false
+        exceptionFormat = org.gradle.api.tasks.testing.logging.TestExceptionFormat.FULL
+    }
 }
 
 // The default `jar` writes a classes-only archive into the same build/libs the

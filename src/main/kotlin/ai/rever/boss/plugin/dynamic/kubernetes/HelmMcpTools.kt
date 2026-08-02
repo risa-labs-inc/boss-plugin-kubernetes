@@ -17,6 +17,12 @@ import java.io.File
  * Same contracts as the k8s side: replies name the context and namespace, mutating
  * tools are RBAC-gated via `withRbac` (never `.copy()`), and rendered output has
  * Secret payloads redacted.
+ *
+ * Release mutation and the two repo registrations take `kubernetes.manage`; pushing
+ * a chart off the machine takes `helm.publish`. The purely local steps (package,
+ * dependency fetch, repo cache refresh, opening a tab) are deliberately ungated —
+ * and `McpToolGatingTest` holds that line, failing unless every `readOnly = false`
+ * tool here is gated or on its justified allow-list.
  */
 class HelmMcpToolProvider(
     override val providerId: String,
@@ -283,34 +289,6 @@ class HelmMcpToolProvider(
         ),
 
         McpToolDefinition(
-            name = "helm_repo_add",
-            description = "Add a chart repository. NOTE: this writes ~/.config/helm/repositories.yaml, which is " +
-                "shared with your shells — the repo will exist outside BOSS too.",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "name":{"type":"string","description":"Local name for the repo"},
-                  "url":{"type":"string","description":"Repository URL"}
-                },"required":["name","url"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireHelm() ?: return@McpToolHandler helmError()
-                val name = args.string("name")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
-                val url = args.string("url")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: url", isError = true)
-                if (actions.repoAdd(name, url)) {
-                    McpToolResult(
-                        "Adding repo $name ($url) in the plugin terminal tab — queued, so check the " +
-                            "tab for the result. This affects the whole machine.",
-                    )
-                } else {
-                    McpToolResult("Couldn't start the command.", isError = true)
-                }
-            },
-        ),
-
-        McpToolDefinition(
             name = "helm_repo_update",
             description = "Refresh the local cache of all configured chart repositories.",
             readOnly = false,
@@ -320,29 +298,6 @@ class HelmMcpToolProvider(
                     McpToolResult("Updating chart repositories in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
                     McpToolResult("Couldn't start the command.", isError = true)
-                }
-            },
-        ),
-
-        McpToolDefinition(
-            name = "helm_repo_remove",
-            description = "Remove a chart repository. Also machine-wide.",
-            inputSchema = """
-                {"type":"object","properties":{
-                  "name":{"type":"string","description":"Repo name to remove"}
-                },"required":["name"]}
-            """.trimIndent(),
-            readOnly = false,
-            handler = McpToolHandler { args ->
-                requireHelm() ?: return@McpToolHandler helmError()
-                val name = args.string("name")
-                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
-                val result = actions.repoRemove(name)
-                helm.refreshRepos()
-                if (result.ok) {
-                    McpToolResult("Removed repo $name (machine-wide).")
-                } else {
-                    McpToolResult(result.cleanError, isError = true)
                 }
             },
         ),
@@ -507,6 +462,69 @@ class HelmMcpToolProvider(
                     McpToolResult("Running tests for $name in ${target()} in the plugin terminal tab — queued, so check the tab for the result.")
                 } else {
                     McpToolResult("Couldn't start the command.", isError = true)
+                }
+            },
+        ),
+
+        McpToolDefinition.withRbac(
+            name = "helm_repo_add",
+            description = "Add a chart repository. NOTE: this writes ~/.config/helm/repositories.yaml, which is " +
+                "shared with your shells — the repo will exist outside BOSS too.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "name":{"type":"string","description":"Local name for the repo"},
+                  "url":{"type":"string","description":"Repository URL"}
+                },"required":["name","url"]}
+            """.trimIndent(),
+            readOnly = false,
+            // Not a cluster mutation, but persistent state written *outside* BOSS
+            // (`HelmActions` keeps this on the default shared config on purpose), and
+            // registering a chart source is the first half of a supply-chain move whose
+            // second half — `helm_upgrade release evil/chart` — is already `kubernetes.manage`.
+            // Splitting them into a separate permission would gate an input to a command
+            // the same caller can point anywhere anyway, so it goes on the same one.
+            requiredPermissions = listOf(PERMISSION_MANAGE),
+            handler = McpToolHandler { args ->
+                requireHelm() ?: return@McpToolHandler helmError()
+                val name = args.string("name")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
+                val url = args.string("url")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: url", isError = true)
+                if (actions.repoAdd(name, url)) {
+                    McpToolResult(
+                        "Adding repo $name ($url) in the plugin terminal tab — queued, so check the " +
+                            "tab for the result. This affects the whole machine.",
+                    )
+                } else {
+                    McpToolResult("Couldn't start the command.", isError = true)
+                }
+            },
+        ),
+
+        McpToolDefinition.withRbac(
+            name = "helm_repo_remove",
+            description = "Remove a chart repository. Also machine-wide.",
+            inputSchema = """
+                {"type":"object","properties":{
+                  "name":{"type":"string","description":"Repo name to remove"}
+                },"required":["name"]}
+            """.trimIndent(),
+            readOnly = false,
+            // Same shared config as helm_repo_add, in the other direction: it deletes a
+            // registration the user's own shells depend on. De-registering is not
+            // self-evidently harmless — it breaks whatever resolves charts through that
+            // repo — so it is gated with the add rather than treated as a tidy-up.
+            requiredPermissions = listOf(PERMISSION_MANAGE),
+            handler = McpToolHandler { args ->
+                requireHelm() ?: return@McpToolHandler helmError()
+                val name = args.string("name")
+                    ?: return@McpToolHandler McpToolResult("Missing required argument: name", isError = true)
+                val result = actions.repoRemove(name)
+                helm.refreshRepos()
+                if (result.ok) {
+                    McpToolResult("Removed repo $name (machine-wide).")
+                } else {
+                    McpToolResult(result.cleanError, isError = true)
                 }
             },
         ),
