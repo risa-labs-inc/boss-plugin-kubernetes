@@ -35,7 +35,7 @@ repositories {
 // Local development: pinned sibling JAR (symlinked next to the worktree).
 // CI: downloaded by the shared release workflow.
 val bossPluginApiJar = if (useLocalDependencies) {
-    files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.66.jar")
+    files("$bossPluginApiPath/build/libs/boss-plugin-api-1.0.73.jar")
 } else {
     files("build/downloaded-deps/boss-plugin-api.jar")
 }

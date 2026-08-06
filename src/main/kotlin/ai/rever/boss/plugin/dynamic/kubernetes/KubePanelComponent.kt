@@ -1,5 +1,6 @@
 package ai.rever.boss.plugin.dynamic.kubernetes
 
+import ai.rever.boss.plugin.ui.BossAlertDialog
 import ai.rever.boss.plugin.api.PanelComponentWithUI
 import ai.rever.boss.plugin.api.PanelInfo
 import ai.rever.boss.plugin.ui.BossSearchBar
@@ -884,7 +885,7 @@ private fun RowShell(
 
 @Composable
 private fun ConfirmDialog(viewModel: KubePanelViewModel, request: ConfirmRequest) {
-    AlertDialog(
+    BossAlertDialog(
         onDismissRequest = viewModel::dismissConfirm,
         backgroundColor = BossThemeColors.SurfaceColor,
         title = { Text(request.title, color = BossThemeColors.TextPrimary, fontSize = 14.sp) },
@@ -904,7 +905,7 @@ private fun ConfirmDialog(viewModel: KubePanelViewModel, request: ConfirmRequest
 
 @Composable
 private fun ScaleDialog(viewModel: KubePanelViewModel, request: ScaleRequest) {
-    AlertDialog(
+    BossAlertDialog(
         onDismissRequest = viewModel::cancelScale,
         backgroundColor = BossThemeColors.SurfaceColor,
         title = { Text("Scale ${request.workload.ref}", color = BossThemeColors.TextPrimary, fontSize = 14.sp) },
@@ -974,7 +975,7 @@ private fun CrdPickerDialog(viewModel: KubePanelViewModel) {
         .filter { filter.isBlank() || it.name.contains(filter, ignoreCase = true) }
         .sortedBy { it.name }
 
-    AlertDialog(
+    BossAlertDialog(
         onDismissRequest = viewModel::closeCrdPicker,
         backgroundColor = BossThemeColors.SurfaceColor,
         title = { Text("Pin a resource type", color = BossThemeColors.TextPrimary, fontSize = 14.sp) },
@@ -1017,7 +1018,7 @@ private fun CrdPickerDialog(viewModel: KubePanelViewModel) {
 
 @Composable
 private fun InstallDialog(viewModel: KubePanelViewModel, request: InstallRequest) {
-    AlertDialog(
+    BossAlertDialog(
         onDismissRequest = viewModel::cancelInstall,
         backgroundColor = BossThemeColors.SurfaceColor,
         title = { Text("Install ${request.chart.name}", color = BossThemeColors.TextPrimary, fontSize = 14.sp) },
@@ -1101,7 +1102,7 @@ private fun InstallDialog(viewModel: KubePanelViewModel, request: InstallRequest
 
 @Composable
 private fun RepoAddDialog(viewModel: KubePanelViewModel, request: RepoAddRequest) {
-    AlertDialog(
+    BossAlertDialog(
         onDismissRequest = viewModel::cancelRepoAdd,
         backgroundColor = BossThemeColors.SurfaceColor,
         title = { Text("Add chart repository", color = BossThemeColors.TextPrimary, fontSize = 14.sp) },
@@ -1165,7 +1166,7 @@ private fun LabelledField(label: String, value: String, onChange: (String) -> Un
  */
 @Composable
 private fun OutputDialog(viewModel: KubePanelViewModel, request: OutputRequest) {
-    AlertDialog(
+    BossAlertDialog(
         onDismissRequest = viewModel::dismissOutput,
         backgroundColor = BossThemeColors.SurfaceColor,
         title = {
